@@ -1,78 +1,241 @@
 """
-model.py — Block Blast Heuristic Search Agent
-===============================================
+model.py — Block Blast Heuristic Search Agent (Bitwise Edition)
+================================================================
 
-Implements the search + evaluation strategy from the reference script,
-adapted to work with our Board / pieces architecture.
+Board representation
+--------------------
+Instead of an 8×8 NumPy array, the search engine internally represents
+the board as a single Python integer (64 bits). Each bit corresponds to
+one cell:
+
+    bit index = row * 8 + col
+    bit 0  → (row=0, col=0)  top-left
+    bit 63 → (row=7, col=7)  bottom-right
+
+This makes the three most common operations O(1) bitwise ops:
+
+    overlap check  : (board & piece_mask) == 0
+    place piece    : board |= piece_mask
+    full row check : (board >> (r*8)) & 0xFF == 0xFF
+
+Pieces are also pre-converted to integer masks once at startup and cached,
+so the per-move cost is minimal.
 
 Architecture
 ------------
-HeuristicAgent
-  ├── evaluate_board()   — scores a board state using piece-fit heuristics
-  ├── _search_perm()     — exhaustive or sampled search over a piece ordering
-  └── best_move()        — public API: returns the best (piece_idx, row, col) next
-
-Search strategy (mirrors reference script):
-  - Generate all permutations of the available pieces
-  - For each permutation, enumerate placements piece1 → piece2 → piece3
-  - If estimated leaf nodes > SAMPLE_THRESHOLD, switch to random sampling
-    at depth 0 (same approach as the reference script's 100-sample fallback)
-  - Score each leaf (final board state) with evaluate_board()
-  - Return the first move of the highest-scoring sequence
+BitBoard         — lightweight board state wrapper (int + helpers)
+HeuristicAgent   — search + evaluation engine
+  ├── best_move()       public API: (piece_idx, row, col)
+  ├── _search_perm()    exhaustive or sampled depth-first search
+  ├── evaluate_board()  scores a BitBoard state
+  └── _count_fits()     bitwise probe-shape fit counter
 """
 
 import random
 import numpy as np
 from itertools import permutations as iter_permutations
+from functools import lru_cache
 from typing import Optional
 
 from board import Board
 
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+_FULL_ROW      = 0xFF                    # 8 bits set — a complete row
+_FULL_COL_BASE = 0x0101010101010101      # col-0 mask (one bit per row)
+_LEFT_MASK     = 0xFEFEFEFEFEFEFEFE         # all cols except col 0 (prevent left-shift wrap)
+_RIGHT_MASK    = 0x7F7F7F7F7F7F7F7F         # all cols except col 7 (prevent right-shift wrap)
+_BOARD_MASK    = (1 << 64) - 1           # all 64 bits
+
+SAMPLE_THRESHOLD = 50_000
+SAMPLE_SIZE      = 100
+
 # ── Default heuristic weights ─────────────────────────────────────────────────
-# Each key maps to a board feature; positive = reward, negative = penalty.
-# These are the starting values derived from the reference script.
 
 DEFAULT_WEIGHTS = {
-    "big_l":           10.0,   # Big-L corner shapes (all 4 orientations)
-    "sq3x3":           20.0,   # 3×3 square fits
-    "sq2x2":            5.0,   # 2×2 square fits
-    "i5":               2.0,   # 5-cell straight fits (H + V)
-    "i4":               0.8,   # 4-cell straight fits
-    "i3":               0.5,   # 3-cell straight fits
-    "line_clear":      30.0,   # per line cleared across the sequence
-    "empty_islands":   -5.0,   # number of isolated empty regions
-    "filled_islands":  -10.0,  # number of isolated filled regions
-    "small_islands":   -20.0,  # regions of size 1–3 (essentially unreachable)
-    "density":          -0.5,  # total filled cells (mild pressure to stay open)
-    "rough_edges":      -0.5,  # jagged filled/empty boundary length
+    "big_l":           10.0,
+    "sq3x3":           20.0,
+    "sq2x2":            5.0,
+    "i5":               2.0,
+    "i4":               0.8,
+    "i3":               0.5,
+    "line_clear":      30.0,
+    "empty_islands":   -5.0,
+    "filled_islands":  -10.0,
+    "small_islands":   -20.0,
+    "density":          -0.5,
+    "rough_edges":      -0.5,
 }
 
-# Sampling thresholds
-SAMPLE_THRESHOLD = 50_000   # switch to sampling above this estimated leaf count
-SAMPLE_SIZE      = 100      # random depth-0 samples per permutation when sampling
+
+# ── BitBoard ──────────────────────────────────────────────────────────────────
+
+class BitBoard:
+    """
+    Lightweight board state as a 64-bit Python integer.
+
+    Bit layout:  bit = row*8 + col
+    Bit set (1) = cell occupied, bit clear (0) = empty.
+
+    Keeps a reference to ROWS/COLS for compatibility but all hot-path
+    operations work directly on self.bits.
+    """
+
+    __slots__ = ("bits",)
+
+    def __init__(self, bits: int = 0):
+        self.bits = bits
+
+    # ── Conversion ────────────────────────────────────────────────────────────
+
+    @classmethod
+    def from_numpy(cls, arr: np.ndarray) -> "BitBoard":
+        bits = 0
+        for r in range(8):
+            for c in range(8):
+                if arr[r, c]:
+                    bits |= (1 << (r * 8 + c))
+        return cls(bits)
+
+    def to_numpy(self) -> np.ndarray:
+        arr = np.zeros((8, 8), dtype=np.int8)
+        bits = self.bits
+        for r in range(8):
+            row_byte = (bits >> (r * 8)) & 0xFF
+            for c in range(8):
+                if row_byte & (1 << c):
+                    arr[r, c] = 1
+        return arr
+
+    # ── Core ops ──────────────────────────────────────────────────────────────
+
+    def can_place(self, shifted_mask: int) -> bool:
+        """True if the pre-shifted piece mask doesn't overlap any filled cell."""
+        return (self.bits & shifted_mask) == 0
+
+    def place(self, shifted_mask: int) -> tuple:
+        """
+        Place a piece and clear completed lines.
+        Returns (new_BitBoard, lines_cleared).
+        Does NOT mutate self.
+        """
+        bits = self.bits | shifted_mask
+        lines_cleared = 0
+
+        # Clear full rows
+        for r in range(8):
+            row_bits = (bits >> (r * 8)) & _FULL_ROW
+            if row_bits == _FULL_ROW:
+                bits &= ~(_FULL_ROW << (r * 8))
+                lines_cleared += 1
+
+        # Clear full columns
+        for c in range(8):
+            col_mask = _FULL_COL_BASE << c
+            if (bits & col_mask) == col_mask:
+                bits &= ~col_mask
+                lines_cleared += 1
+
+        return BitBoard(bits), lines_cleared
+
+    def popcount(self) -> int:
+        """Number of filled cells (set bits)."""
+        return bin(self.bits).count("1")
+
+    def copy(self) -> "BitBoard":
+        return BitBoard(self.bits)
+
+    def __eq__(self, other):
+        return self.bits == other.bits
+
+    def __hash__(self):
+        return hash(self.bits)
 
 
-# ── Probe shapes for _count_fits ─────────────────────────────────────────────
-# Unpadded binary arrays representing each piece shape we probe for.
+# ── Piece mask cache ──────────────────────────────────────────────────────────
 
-_PROBE_2x2 = np.array([[1,1],[1,1]])
-_PROBE_3x3 = np.array([[1,1,1],[1,1,1],[1,1,1]])
-_PROBE_I5H = np.array([[1,1,1,1,1]])
-_PROBE_I5V = np.array([[1],[1],[1],[1],[1]])
-_PROBE_I4H = np.array([[1,1,1,1]])
-_PROBE_I4V = np.array([[1],[1],[1],[1]])
-_PROBE_I3H = np.array([[1,1,1]])
-_PROBE_I3V = np.array([[1],[1],[1]])
-_PROBE_BL  = np.array([[1,0,0],[1,0,0],[1,1,1]])   # Big-L bottom-left
-_PROBE_BR  = np.array([[0,0,1],[0,0,1],[1,1,1]])   # Big-L bottom-right
-_PROBE_TL  = np.array([[1,1,1],[1,0,0],[1,0,0]])   # Big-L top-left
-_PROBE_TR  = np.array([[1,1,1],[0,0,1],[0,0,1]])   # Big-L top-right
+def _build_piece_masks(piece_arr: np.ndarray) -> tuple:
+    """
+    Convert a 5×5 padded piece array into:
+      base_mask : int   — piece mask aligned to (0,0), no padding
+      h         : int   — bounding box height
+      w         : int   — bounding box width
+      shifted   : dict  — {(row, col): shifted_mask} for all valid placements
 
+    The shifted dict is pre-computed so valid_moves and placement during
+    search are O(1) dictionary lookups instead of repeated bit-shifting.
+    """
+    filled_rows, filled_cols = np.where(piece_arr != 0)
+    if len(filled_rows) == 0:
+        return 0, 0, 0, {}
+
+    min_r = int(filled_rows.min())
+    min_c = int(filled_cols.min())
+
+    base_mask = 0
+    for r, c in zip(filled_rows.tolist(), filled_cols.tolist()):
+        bit = (r - min_r) * 8 + (c - min_c)
+        base_mask |= (1 << bit)
+
+    h = int(filled_rows.max() - min_r + 1)
+    w = int(filled_cols.max() - min_c + 1)
+
+    # Pre-shift for every valid (row, col) on an 8×8 board
+    shifted = {}
+    for row in range(8 - h + 1):
+        for col in range(8 - w + 1):
+            shift = row * 8 + col
+            shifted[(row, col)] = base_mask << shift
+
+    return base_mask, h, w, shifted
+
+
+# Precompute masks for every piece in ALL_PIECES at import time
+_PIECE_MASK_CACHE: dict = {}
+
+def get_piece_masks(piece_arr: np.ndarray) -> tuple:
+    """Return cached (base_mask, h, w, shifted_dict) for this piece array."""
+    key = piece_arr.tobytes()
+    if key not in _PIECE_MASK_CACHE:
+        _PIECE_MASK_CACHE[key] = _build_piece_masks(piece_arr)
+    return _PIECE_MASK_CACHE[key]
+
+
+# ── Probe masks for evaluate_board ───────────────────────────────────────────
+# Pre-built shifted dicts for every probe shape used in heuristic evaluation.
+
+def _probe_masks(shape_2d: list) -> list:
+    """Convert a 2D list shape into a list of all shifted masks on 8×8 board."""
+    arr = np.array(shape_2d, dtype=np.int8)
+    # Pad to 5×5 so get_piece_masks works
+    padded = np.zeros((5, 5), dtype=np.int8)
+    padded[:arr.shape[0], :arr.shape[1]] = arr
+    _, _, _, shifted = get_piece_masks(padded)
+    return list(shifted.values())
+
+# Built once at module load
+_PROBE_MASKS = {
+    "big_l_bl":  _probe_masks([[1,0,0],[1,0,0],[1,1,1]]),
+    "big_l_br":  _probe_masks([[0,0,1],[0,0,1],[1,1,1]]),
+    "big_l_tl":  _probe_masks([[1,1,1],[1,0,0],[1,0,0]]),
+    "big_l_tr":  _probe_masks([[1,1,1],[0,0,1],[0,0,1]]),
+    "sq3x3":     _probe_masks([[1,1,1],[1,1,1],[1,1,1]]),
+    "sq2x2":     _probe_masks([[1,1],[1,1]]),
+    "i5h":       _probe_masks([[1,1,1,1,1]]),
+    "i5v":       _probe_masks([[1],[1],[1],[1],[1]]),
+    "i4h":       _probe_masks([[1,1,1,1]]),
+    "i4v":       _probe_masks([[1],[1],[1],[1]]),
+    "i3h":       _probe_masks([[1,1,1]]),
+    "i3v":       _probe_masks([[1],[1],[1]]),
+}
+
+
+# ── HeuristicAgent ────────────────────────────────────────────────────────────
 
 class HeuristicAgent:
     """
-    Stateless heuristic search agent for Block Blast.
+    Heuristic search agent using a bitwise board representation.
 
     Usage
     -----
@@ -81,14 +244,10 @@ class HeuristicAgent:
 
     Parameters
     ----------
-    weights : dict, optional
-        Override default heuristic weights. Useful for evolutionary tuning.
-    sample_threshold : int
-        Estimated leaf count above which random sampling is used.
-    sample_size : int
-        Number of depth-0 positions sampled per permutation when sampling.
-    verbose : bool
-        Print per-call search diagnostics.
+    weights          : dict — override DEFAULT_WEIGHTS
+    sample_threshold : int  — switch to sampling above this leaf estimate
+    sample_size      : int  — depth-0 samples per perm when sampling
+    verbose          : bool — print search diagnostics
     """
 
     def __init__(
@@ -115,36 +274,24 @@ class HeuristicAgent:
         """
         Return (piece_idx, row, col) for the best next placement.
 
-        Parameters
-        ----------
-        board  : current Board instance
-        pieces : list of 3 piece arrays (5×5 padded)
-        used   : list of 3 bools — which pieces are already placed this round
-        streak : current game streak (informs line-clear reward scaling)
-
-        Returns
-        -------
-        (piece_idx, row, col)
+        Converts the Board to a BitBoard once, then runs all search
+        internally on integer operations.
         """
-        # Pairs of (original_index, piece_array) for unplaced pieces
+        bb = BitBoard.from_numpy(board.board)
+
         available = [
             (i, p) for i, (p, u) in enumerate(zip(pieces, used)) if not u
         ]
-
         if not available:
             raise ValueError("No unplaced pieces available.")
 
-        # Only one piece left — skip full search, just pick its best placement
         if len(available) == 1:
             idx, piece = available[0]
-            row, col = self._best_single(board, piece, streak)
+            row, col = self._best_single(bb, piece, streak)
             return idx, row, col
 
-        # All orderings of the remaining pieces
-        all_perms = list(iter_permutations(available))
-
-        # Decide exhaustive vs. sampling
-        leaf_estimate = self._estimate_leaves(board, all_perms)
+        all_perms     = list(iter_permutations(available))
+        leaf_estimate = self._estimate_leaves(bb, all_perms)
         use_sampling  = leaf_estimate > self.sample_threshold
 
         if self.verbose:
@@ -155,22 +302,21 @@ class HeuristicAgent:
         best_first_move = None
 
         for perm in all_perms:
-            paths = self._search_perm(board, perm, use_sampling)
+            paths = self._search_perm(bb, perm, use_sampling)
             for path in paths:
                 score = self._score_path(path, streak)
                 if score > best_score:
                     best_score      = score
-                    # First step of path = (orig_idx, row, col, lines_cleared)
                     first           = path[0]
                     best_first_move = (perm[0][0], first[1], first[2])
 
-        # Fallback — should rarely trigger
         if best_first_move is None:
             idx, piece = available[0]
-            moves = board.valid_moves(piece)
-            if moves:
-                return idx, moves[0][0], moves[0][1]
-            raise ValueError("No valid moves found for any piece.")
+            _, _, _, shifted = get_piece_masks(piece)
+            for (row, col), mask in shifted.items():
+                if bb.can_place(mask):
+                    return idx, row, col
+            raise ValueError("No valid moves found.")
 
         if self.verbose:
             print(f"  [agent] best_score={best_score:.1f}  move={best_first_move}")
@@ -179,217 +325,213 @@ class HeuristicAgent:
 
     # ── Search ────────────────────────────────────────────────────────────────
 
-    def _search_perm(
-        self,
-        board: Board,
-        perm: list,
-        use_sampling: bool,
-    ) -> list:
-        """
-        Enumerate (or sample) all placement sequences for one piece ordering.
-
-        Returns a list of paths where each path is:
-            [ (piece_idx, row, col, lines_cleared), ..., final_board_array ]
-        """
+    def _search_perm(self, bb: BitBoard, perm: list, use_sampling: bool) -> list:
         paths = []
-        self._recurse(board, perm, 0, [], paths, use_sampling)
+        self._recurse(bb, perm, 0, [], paths, use_sampling)
         return paths
 
     def _recurse(
         self,
-        board: Board,
+        bb: BitBoard,
         perm: list,
         depth: int,
         path_so_far: list,
         results: list,
         use_sampling: bool,
     ):
-        # Leaf node — record the completed path
         if depth == len(perm):
-            results.append(path_so_far + [board.board.copy()])
+            results.append(path_so_far + [bb])
             return
 
         idx, piece = perm[depth]
-        moves = board.valid_moves(piece)
+        _, _, _, shifted = get_piece_masks(piece)
 
-        if not moves:
-            return  # dead end for this ordering
+        # All valid placements via bitwise overlap check
+        valid = [
+            (row, col) for (row, col), mask in shifted.items()
+            if bb.can_place(mask)
+        ]
 
-        # Only sample at depth 0 to limit branching (mirrors reference script)
+        if not valid:
+            return
+
         if use_sampling and depth == 0:
-            moves = random.sample(moves, min(self.sample_size, len(moves)))
+            valid = random.sample(valid, min(self.sample_size, len(valid)))
 
-        for row, col in moves:
-            new_board     = board.copy()
-            lines_cleared = new_board.apply_move(piece, row, col)
+        for row, col in valid:
+            mask          = shifted[(row, col)]
+            new_bb, lines = bb.place(mask)
             self._recurse(
-                new_board,
+                new_bb,
                 perm,
                 depth + 1,
-                path_so_far + [(idx, row, col, lines_cleared)],
+                path_so_far + [(idx, row, col, lines)],
                 results,
                 use_sampling,
             )
 
-    def _best_single(self, board: Board, piece: np.ndarray, streak: int) -> tuple:
-        """Best placement when only one piece remains — evaluate each move directly."""
-        moves      = board.valid_moves(piece)
+    def _best_single(self, bb: BitBoard, piece: np.ndarray, streak: int) -> tuple:
+        _, _, _, shifted = get_piece_masks(piece)
         best_score = -1e9
-        best_rc    = moves[0]
+        best_rc    = None
 
-        for row, col in moves:
-            b             = board.copy()
-            lines_cleared = b.apply_move(piece, row, col)
-            score         = self.evaluate_board(b.board, lines_cleared=lines_cleared, streak=streak)
+        for (row, col), mask in shifted.items():
+            if not bb.can_place(mask):
+                continue
+            new_bb, lines = bb.place(mask)
+            score = self.evaluate_board(new_bb, lines_cleared=lines, streak=streak)
             if score > best_score:
                 best_score = score
                 best_rc    = (row, col)
 
-        return best_rc
+        return best_rc or (0, 0)
 
     # ── Scoring ───────────────────────────────────────────────────────────────
 
     def _score_path(self, path: list, streak: int) -> float:
-        """
-        Score a complete path.
-        path[-1]  = final board array (numpy)
-        path[:-1] = list of (piece_idx, row, col, lines_cleared)
-        """
-        final_board  = path[-1]
+        final_bb     = path[-1]
         total_clears = sum(step[3] for step in path[:-1])
-        return self.evaluate_board(final_board, lines_cleared=total_clears, streak=streak)
+        return self.evaluate_board(final_bb, lines_cleared=total_clears, streak=streak)
 
     def evaluate_board(
         self,
-        board: np.ndarray,
+        bb: BitBoard,
         lines_cleared: int = 0,
         streak: int = 0,
     ) -> float:
         """
-        Score a board state. Higher is better.
+        Score a BitBoard state. Higher = better.
 
-        Combines piece-fit flexibility, line-clear rewards, and
-        penalties for fragmentation and board roughness.
+        All probe-fit counting is done via bitwise AND against pre-built
+        masks — no inner Python loops over the board.
         """
         W     = self.weights
+        bits  = bb.bits
         score = 0.0
 
-        # ── Piece-fit flexibility (how open is the board?) ────────────────────
-        score += self._count_fits(_PROBE_BL,  board) * W["big_l"]
-        score += self._count_fits(_PROBE_BR,  board) * W["big_l"]
-        score += self._count_fits(_PROBE_TL,  board) * W["big_l"]
-        score += self._count_fits(_PROBE_TR,  board) * W["big_l"]
-        score += self._count_fits(_PROBE_3x3, board) * W["sq3x3"]
-        score += self._count_fits(_PROBE_2x2, board) * W["sq2x2"]
-        score += self._count_fits(_PROBE_I5H, board) * W["i5"]
-        score += self._count_fits(_PROBE_I5V, board) * W["i5"]
-        score += self._count_fits(_PROBE_I4H, board) * W["i4"]
-        score += self._count_fits(_PROBE_I4V, board) * W["i4"]
-        score += self._count_fits(_PROBE_I3H, board) * W["i3"]
-        score += self._count_fits(_PROBE_I3V, board) * W["i3"]
+        # ── Piece-fit flexibility ─────────────────────────────────────────────
+        # A probe "fits" at a position if (board & probe_mask) == 0
+        # i.e. all probe cells are empty on the board.
+
+        for m in _PROBE_MASKS["big_l_bl"]: score += (bits & m) == 0
+        for m in _PROBE_MASKS["big_l_br"]: score += (bits & m) == 0
+        for m in _PROBE_MASKS["big_l_tl"]: score += (bits & m) == 0
+        for m in _PROBE_MASKS["big_l_tr"]: score += (bits & m) == 0
+        score *= W["big_l"] / 4   # already summed all 4 orientations
+
+        sq3 = sum((bits & m) == 0 for m in _PROBE_MASKS["sq3x3"])
+        sq2 = sum((bits & m) == 0 for m in _PROBE_MASKS["sq2x2"])
+        i5  = sum((bits & m) == 0 for m in _PROBE_MASKS["i5h"]) + \
+              sum((bits & m) == 0 for m in _PROBE_MASKS["i5v"])
+        i4  = sum((bits & m) == 0 for m in _PROBE_MASKS["i4h"]) + \
+              sum((bits & m) == 0 for m in _PROBE_MASKS["i4v"])
+        i3  = sum((bits & m) == 0 for m in _PROBE_MASKS["i3h"]) + \
+              sum((bits & m) == 0 for m in _PROBE_MASKS["i3v"])
+
+        score += sq3 * W["sq3x3"]
+        score += sq2 * W["sq2x2"]
+        score += i5  * W["i5"]
+        score += i4  * W["i4"]
+        score += i3  * W["i3"]
 
         # ── Line clear reward ─────────────────────────────────────────────────
         score += lines_cleared * W["line_clear"]
 
         # ── Fragmentation penalties ───────────────────────────────────────────
-        empty_islands  = self._count_islands(board, value=0)
-        filled_islands = self._count_islands(board, value=1)
+        board_arr      = bb.to_numpy()
+        empty_islands  = self._count_islands(board_arr, value=0)
+        filled_islands = self._count_islands(board_arr, value=1)
 
         score += len(empty_islands)  * W["empty_islands"]
         score += len(filled_islands) * W["filled_islands"]
-
-        # Extra penalty for tiny unreachable pockets (size 1–3)
         score += len([s for s in empty_islands  if s <= 3]) * W["small_islands"]
         score += len([s for s in filled_islands if s <= 3]) * W["small_islands"]
 
         # ── Density and roughness ─────────────────────────────────────────────
-        score += np.count_nonzero(board) * W["density"]
-        score += self._rough_edges(board) * W["rough_edges"]
+        score += bb.popcount() * W["density"]
+        score += self._rough_edges_bitwise(bits) * W["rough_edges"]
 
         return score
 
-    # ── Board analysis helpers ────────────────────────────────────────────────
+    # ── Board analysis ────────────────────────────────────────────────────────
 
     @staticmethod
-    def _count_fits(probe: np.ndarray, board: np.ndarray) -> int:
+    def _rough_edges_bitwise(bits: int) -> int:
         """
-        Count positions where `probe` fits in empty space on `board`.
-        A fit means every cell marked 1 in probe is 0 on the board.
+        Count filled cells that border at least one empty cell.
+        Uses bitwise shifts instead of nested Python loops.
+
+        Shift the board in each of 4 directions and XOR against
+        the original to find boundary cells.
         """
-        pr, pc = probe.shape
-        br, bc = board.shape
-        count  = 0
-        for r in range(br - pr + 1):
-            for c in range(bc - pc + 1):
-                if not np.any(board[r:r+pr, c:c+pc][probe == 1]):
-                    count += 1
-        return count
+        # Neighbour masks (avoid wrapping at row/col edges)
+        LEFT_MASK  = 0xFEFEFEFEFEFEFEFE   # all cols except col 0
+        RIGHT_MASK = 0x7F7F7F7F7F7F7F7F   # all cols except col 7
+
+        up    = bits >> 8
+        down  = bits << 8
+        left  = (bits >> 1) & LEFT_MASK
+        right = (bits << 1) & RIGHT_MASK
+
+        # Cells that have at least one empty neighbour
+        has_empty_neighbour = bits & ~(up & down & left & right) & _BOARD_MASK
+        return bin(has_empty_neighbour).count("1")
+
+    @staticmethod
+    def _flood_expand(seed: int, allowed: int) -> int:
+        """
+        Expand seed bits to all connected cells within `allowed` using bitwise shifts.
+        Up/down = shift by 8 bits (one row), left/right = shift by 1 bit with edge masks.
+        Iterates until stable (no new cells added).
+        """
+        while True:
+            prev = seed
+            seed = (seed
+                    | (seed >> 8)
+                    | ((seed << 8) & _BOARD_MASK)
+                    | ((seed >> 1) & _LEFT_MASK)
+                    | ((seed << 1) & _RIGHT_MASK)
+                    ) & allowed
+            if seed == prev:
+                break
+        return seed
 
     @staticmethod
     def _count_islands(board: np.ndarray, value: int) -> list:
         """
-        Flood-fill to find all connected regions of `value`.
-        Returns list of region sizes. Regions >= 8 cells are ignored
-        (large open areas aren't a concern).
-        """
-        visited = np.zeros_like(board, dtype=bool)
-        sizes   = []
-        rows, cols = board.shape
+        Bitwise flood-fill to find connected regions of `value`.
+        Returns list of region sizes < 8 (large open areas are not a concern).
 
-        for start_r in range(rows):
-            for start_c in range(cols):
-                if visited[start_r, start_c] or board[start_r, start_c] != value:
-                    continue
-                # Iterative flood fill
-                stack = [(start_r, start_c)]
-                size  = 0
-                while stack:
-                    r, c = stack.pop()
-                    if r < 0 or r >= rows or c < 0 or c >= cols:
-                        continue
-                    if visited[r, c] or board[r, c] != value:
-                        continue
-                    visited[r, c] = True
-                    size += 1
-                    if size >= 8:
-                        break
-                    stack.extend([(r-1,c),(r+1,c),(r,c-1),(r,c+1)])
-                # Mark remaining stack items visited to avoid re-processing
-                while stack:
-                    r, c = stack.pop()
-                    if 0 <= r < rows and 0 <= c < cols:
-                        visited[r, c] = True
-                if size < 8:
-                    sizes.append(size)
+        Works on the board as a 64-bit integer: each region is found by
+        isolating the lowest set bit as a seed, flood-expanding it within
+        the target mask, recording the size, then clearing that region and
+        repeating until no cells remain.
+        """
+        # Build target bitmask from the numpy array
+        target = 0
+        for r in range(8):
+            for c in range(8):
+                if board[r, c] == value:
+                    target |= (1 << (r * 8 + c))
+
+        remaining = target
+        sizes     = []
+
+        while remaining:
+            seed   = remaining & (-remaining)   # isolate lowest set bit
+            region = HeuristicAgent._flood_expand(seed, target)
+            size   = bin(region).count("1")
+            remaining &= ~region
+            if size < 8:
+                sizes.append(size)
 
         return sizes
 
     @staticmethod
-    def _rough_edges(board: np.ndarray) -> int:
-        """
-        Count filled cells that border at least one empty cell.
-        Measures how jagged the filled/empty boundary is.
-        """
-        count      = 0
-        rows, cols = board.shape
-        for r in range(rows):
-            for c in range(cols):
-                if board[r, c] == 1:
-                    for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
-                        nr, nc = r+dr, c+dc
-                        if 0 <= nr < rows and 0 <= nc < cols and board[nr,nc] == 0:
-                            count += 1
-        return count
-
-    @staticmethod
-    def _estimate_leaves(board: Board, all_perms: list) -> int:
-        """
-        Cheap upper-bound on total leaf nodes across all permutations.
-        Uses valid move count of the first piece as a branching proxy.
-        """
+    def _estimate_leaves(bb: BitBoard, all_perms: list) -> int:
         total = 0
         for perm in all_perms:
-            n = len(board.valid_moves(perm[0][1]))
-            # Subsequent depths assumed to have roughly halving branching
+            _, _, _, shifted = get_piece_masks(perm[0][1])
+            n = sum(1 for mask in shifted.values() if bb.can_place(mask))
             total += n * max(1, n // 2) * max(1, n // 4)
         return total
