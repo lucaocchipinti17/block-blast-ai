@@ -53,6 +53,7 @@ def _ensure_loaded() -> ctypes.CDLL:
             ctypes.POINTER(ctypes.c_int),           # hs
             ctypes.POINTER(ctypes.c_int),           # ws
             ctypes.POINTER(ctypes.c_int),           # piece_indices
+            ctypes.POINTER(ctypes.c_int),           # piece_cells
             ctypes.c_int,                           # n_pieces
             ctypes.POINTER(ctypes.c_double),        # weights
             ctypes.c_int,                           # sample_threshold
@@ -62,6 +63,9 @@ def _ensure_loaded() -> ctypes.CDLL:
             ctypes.c_int,                           # cap_depth1
             ctypes.c_int,                           # cap_depth2
             ctypes.c_int,                           # eval_cache_max
+            ctypes.c_int,                           # initial_streak
+            ctypes.c_double,                        # board_weight
+            ctypes.c_double,                        # streak_bonus
             ctypes.POINTER(ctypes.c_int),           # out_len
             ctypes.POINTER(ctypes.c_int),           # out_piece_idx
             ctypes.POINTER(ctypes.c_int),           # out_row
@@ -89,6 +93,7 @@ def best_plan_cpp(
     hs: list[int],
     ws: list[int],
     piece_indices: list[int],
+    piece_cells: list[int],
     weights: list[float],
     sample_threshold: int,
     sample_size: int,
@@ -97,6 +102,9 @@ def best_plan_cpp(
     cap_depth1: int,
     cap_depth2: int,
     eval_cache_max: int,
+    initial_streak: int,
+    board_weight: float,
+    streak_bonus: float,
 ) -> Optional[list[tuple[int, int, int]]]:
     lib = _ensure_loaded()
 
@@ -108,6 +116,7 @@ def best_plan_cpp(
     c_hs = (ctypes.c_int * n)(*hs)
     c_ws = (ctypes.c_int * n)(*ws)
     c_indices = (ctypes.c_int * n)(*piece_indices)
+    c_cells = (ctypes.c_int * n)(*piece_cells)
     c_weights = (ctypes.c_double * len(weights))(*weights)
 
     out_len = ctypes.c_int(0)
@@ -121,6 +130,7 @@ def best_plan_cpp(
         c_hs,
         c_ws,
         c_indices,
+        c_cells,
         ctypes.c_int(n),
         c_weights,
         ctypes.c_int(sample_threshold),
@@ -130,6 +140,9 @@ def best_plan_cpp(
         ctypes.c_int(cap_depth1),
         ctypes.c_int(cap_depth2),
         ctypes.c_int(eval_cache_max),
+        ctypes.c_int(initial_streak),
+        ctypes.c_double(board_weight),
+        ctypes.c_double(streak_bonus),
         ctypes.byref(out_len),
         out_piece_idx,
         out_row,

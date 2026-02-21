@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import tkinter as tk
+import time
 from tkinter import messagebox
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -220,11 +221,20 @@ class PlannerGUI(tk.Tk):
         self.score = 0
         self.streak = 0
 
+        self.timer_total_seconds = 6 * 60
+        self.timer_remaining_seconds = self.timer_total_seconds
+        self.timer_running = False
+        self.timer_job: Optional[str] = None
+        self.timer_end_monotonic: Optional[float] = None
+
         self.status_var = tk.StringVar(value="Draw board/pieces, then click Submit.")
         self.score_var = tk.StringVar(value="Score: 0   Streak: 0")
+        self.timer_var = tk.StringVar(value=f"Time: {self._format_seconds(self.timer_remaining_seconds)}")
+        self.profile_var = tk.StringVar(value="Profile: balanced")
 
         self._build_layout()
         self._sync_board_view()
+        self._refresh_profile_label()
 
     def _build_layout(self) -> None:
         root = tk.Frame(self, padx=10, pady=10)
@@ -232,8 +242,17 @@ class PlannerGUI(tk.Tk):
 
         top = tk.Frame(root)
         top.pack(fill=tk.X)
-        tk.Label(top, textvariable=self.score_var, font=("Helvetica", 11, "bold")).pack(side=tk.LEFT)
-        tk.Label(top, textvariable=self.status_var, fg="#2a4d8f").pack(side=tk.LEFT, padx=12)
+        top_left = tk.Frame(top)
+        top_left.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(top_left, textvariable=self.score_var, font=("Helvetica", 11, "bold")).pack(side=tk.LEFT)
+        tk.Label(top_left, textvariable=self.status_var, fg="#2a4d8f").pack(side=tk.LEFT, padx=12)
+
+        top_right = tk.Frame(top)
+        top_right.pack(side=tk.RIGHT)
+        self.start_timer_btn = tk.Button(top_right, text="Start timer", command=self._start_timer)
+        self.start_timer_btn.pack(side=tk.RIGHT)
+        tk.Label(top_right, textvariable=self.timer_var, font=("Helvetica", 11, "bold")).pack(side=tk.RIGHT, padx=(0, 10))
+        tk.Label(top_right, textvariable=self.profile_var, font=("Helvetica", 10)).pack(side=tk.RIGHT, padx=(0, 10))
 
         middle = tk.Frame(root)
         middle.pack(pady=(8, 10))
@@ -286,6 +305,73 @@ class PlannerGUI(tk.Tk):
     def _sync_board_view(self) -> None:
         self.board_view.set_data(self.board.board)
         self.score_var.set(f"Score: {self.score}   Streak: {self.streak}")
+        self._refresh_profile_label()
+
+    @staticmethod
+    def _format_seconds(seconds: int) -> str:
+        mm = max(0, int(seconds)) // 60
+        ss = max(0, int(seconds)) % 60
+        return f"{mm:02d}:{ss:02d}"
+
+    def _active_profile(self) -> str:
+        remaining = self._current_remaining_seconds()
+        # If timer has not started, stay on balanced.
+        if (not self.timer_running) and remaining == self.timer_total_seconds:
+            return "balanced"
+        if remaining <= 120:
+            return "aggressive"
+        if remaining <= 240:
+            return "balanced"
+        return "safe"
+
+    def _refresh_profile_label(self) -> str:
+        self.timer_remaining_seconds = self._current_remaining_seconds()
+        self.timer_var.set(f"Time: {self._format_seconds(self.timer_remaining_seconds)}")
+        profile = self._active_profile()
+        self.profile_var.set(f"Profile: {profile}")
+        return profile
+
+    def _current_remaining_seconds(self) -> int:
+        if self.timer_running and self.timer_end_monotonic is not None:
+            remaining = max(0, int(self.timer_end_monotonic - time.monotonic() + 0.999))
+            self.timer_remaining_seconds = remaining
+            if remaining <= 0:
+                self.timer_running = False
+                self.timer_end_monotonic = None
+            return remaining
+        return self.timer_remaining_seconds
+
+    def _cancel_timer_job(self) -> None:
+        if self.timer_job is not None:
+            self.after_cancel(self.timer_job)
+            self.timer_job = None
+
+    def _start_timer(self) -> None:
+        self._cancel_timer_job()
+        self.timer_remaining_seconds = self.timer_total_seconds
+        self.timer_running = True
+        self.timer_end_monotonic = time.monotonic() + self.timer_total_seconds
+        self._refresh_profile_label()
+        self.status_var.set("Timer started (6:00). Profile auto-switches by time left.")
+        self.timer_job = self.after(1000, self._timer_tick)
+
+    def _timer_tick(self) -> None:
+        if not self.timer_running:
+            self.timer_job = None
+            return
+
+        self.timer_remaining_seconds = self._current_remaining_seconds()
+        self.timer_var.set(f"Time: {self._format_seconds(self.timer_remaining_seconds)}")
+        self._refresh_profile_label()
+
+        if self.timer_remaining_seconds <= 0:
+            self.timer_running = False
+            self.timer_end_monotonic = None
+            self.timer_job = None
+            self.status_var.set("Timer ended. Planner now uses aggressive profile.")
+            return
+
+        self.timer_job = self.after(1000, self._timer_tick)
 
     def _resolve_pieces(self) -> Optional[List[PieceMeta]]:
         chosen: List[PieceMeta] = []
@@ -302,7 +388,7 @@ class PlannerGUI(tk.Tk):
             chosen.append(matches[0])
         return chosen
 
-    def _paint_preview(self, panel: PiecePanel, piece: np.ndarray, row: int, col: int) -> None:
+    def _paint_preview(self, panel: MovePreviewPanel, piece: np.ndarray, row: int, col: int) -> None:
         arr = self.board.board.copy()
         cells, _, _ = Board.get_footprint(piece)
         for dr, dc in cells:
@@ -330,7 +416,8 @@ class PlannerGUI(tk.Tk):
                 p.reset()
             return
 
-        plan = self.agent.best_plan(self.board, piece_bank, used, self.streak)
+        active_profile = self._refresh_profile_label()
+        plan = self.agent.best_plan(self.board, piece_bank, used, self.streak, profile=active_profile)
         if not plan:
             self.status_var.set("Agent could not find a valid plan.")
             for p in self.move_panels:
@@ -371,7 +458,10 @@ class PlannerGUI(tk.Tk):
                 p.clear()
 
         self._sync_board_view()
-        self.status_var.set(" | ".join(lines_out) if lines_out else "No moves applied.")
+        if lines_out:
+            self.status_var.set(f"profile={active_profile} | " + " | ".join(lines_out))
+        else:
+            self.status_var.set("No moves applied.")
 
 
 def main() -> None:

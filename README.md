@@ -42,13 +42,13 @@ Pieces are stored as 5×5 arrays with empty padding around them. Before anything
 The score formula was reverse-engineered from real game data:
 
 ```
-points = tiles_placed + (lines_cleared² × streak × 10)
+points = tiles_placed + (lines_cleared × streak × 10)
 ```
 
 A few things to notice:
 
 - **Tiles placed** always count — even a move that clears nothing scores 1 point per cell placed.
-- **Lines cleared** are squared — clearing 2 lines at once is worth 4× a single line, not 2×. This heavily rewards combo placements.
+- **Line clear bonus** scales linearly with the number of lines cleared in that move.
 - **Streak** multiplies line points — each consecutive round where you clear at least one line increases your streak by 1. A streak of 5 makes every line worth 50 points instead of 10.
 - **Streak resets** only at the end of a full round (all 3 pieces placed) with zero line clears. Missing a line mid-round doesn't reset anything.
 

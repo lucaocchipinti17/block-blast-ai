@@ -91,6 +91,12 @@ _WEIGHT_KEYS = [
     "rough_edges",
 ]
 
+PROFILE_CONFIGS = {
+    "safe": {"board_weight": 0.70, "streak_bonus": 6.0},
+    "balanced": {"board_weight": 0.35, "streak_bonus": 10.0},
+    "aggressive": {"board_weight": 0.12, "streak_bonus": 16.0},
+}
+
 
 # ── BitBoard ──────────────────────────────────────────────────────────────────
 
@@ -283,6 +289,7 @@ class HeuristicAgent:
         depth_branch_caps: Optional[dict[int, int]] = None,
         eval_cache_max: int = 200_000,
         use_cpp_backend: bool = True,
+        default_profile: str = "balanced",
         verbose: bool = False,
     ):
         self.weights          = {**DEFAULT_WEIGHTS, **(weights or {})}
@@ -308,6 +315,7 @@ class HeuristicAgent:
         else:
             self.depth_branch_caps = depth_branch_caps
 
+        self.default_profile = default_profile if default_profile in PROFILE_CONFIGS else "balanced"
         self.verbose          = verbose
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -318,11 +326,12 @@ class HeuristicAgent:
         pieces: list,
         used: list,
         streak: int = 0,
+        profile: Optional[str] = None,
     ) -> tuple:
         """
         Return (piece_idx, row, col) for the best next placement.
         """
-        plan = self.best_plan(board, pieces, used, streak)
+        plan = self.best_plan(board, pieces, used, streak, profile=profile)
         if not plan:
             raise ValueError("No valid moves found.")
         return plan[0]
@@ -333,6 +342,7 @@ class HeuristicAgent:
         pieces: list,
         used: list,
         streak: int = 0,
+        profile: Optional[str] = None,
     ) -> list[tuple[int, int, int]]:
         """
         Return a placement plan for the current piece bank as:
@@ -344,6 +354,7 @@ class HeuristicAgent:
         plan so callers can still execute without re-running search each turn.
         """
         bb = BitBoard.from_numpy(board.board)
+        profile_name, board_weight, streak_bonus = self._resolve_profile(profile)
         available = [
             (i, p) for i, (p, u) in enumerate(zip(pieces, used)) if not u
         ]
@@ -352,13 +363,24 @@ class HeuristicAgent:
 
         if len(available) == 1:
             idx, piece = available[0]
-            row, col = self._best_single(bb, piece, streak)
+            row, col = self._best_single(bb, piece, streak, board_weight, streak_bonus)
             return [(idx, row, col)]
 
-        cpp_plan = self._best_plan_cpp(bb, available)
+        cells_per_idx = {}
+        for idx, piece in available:
+            cells_per_idx[idx] = int(len(Board.get_footprint(piece)[0]))
+
+        cpp_plan = self._best_plan_cpp(
+            bb=bb,
+            available=available,
+            streak=streak,
+            board_weight=board_weight,
+            streak_bonus=streak_bonus,
+            cells_per_idx=cells_per_idx,
+        )
         if cpp_plan:
             if self.verbose:
-                print("  [agent] using C++ backend")
+                print(f"  [agent] using C++ backend  profile={profile_name}")
             return cpp_plan
 
         all_perms     = list(iter_permutations(available))
@@ -378,7 +400,8 @@ class HeuristicAgent:
             mode = "sampling" if use_sampling else "exhaustive"
             print(
                 f"  [agent] perms={len(all_perms)}  ~leaves={leaf_estimate}  "
-                f"mode={mode}  budget={self.time_budget_ms}ms/{self.max_nodes}nodes"
+                f"mode={mode}  budget={self.time_budget_ms}ms/{self.max_nodes}nodes  "
+                f"profile={profile_name}"
             )
 
         best_score = -1e9
@@ -400,6 +423,9 @@ class HeuristicAgent:
                 perm,
                 use_sampling,
                 streak,
+                board_weight,
+                streak_bonus,
+                cells_per_idx,
                 deadline=deadline,
                 node_budget=nodes_left,
             )
@@ -416,15 +442,33 @@ class HeuristicAgent:
             return plan
 
         # Fallback: greedy multi-step planning if no complete path exists.
-        plan = self._greedy_plan(bb, available, streak)
+        plan = self._greedy_plan(
+            bb=bb,
+            available=available,
+            streak=streak,
+            board_weight=board_weight,
+            streak_bonus=streak_bonus,
+            cells_per_idx=cells_per_idx,
+        )
         if self.verbose:
             print(f"  [agent] fallback_greedy_plan={plan}")
         return plan
+
+    def _resolve_profile(self, profile: Optional[str]) -> tuple[str, float, float]:
+        name = profile or self.default_profile
+        if name not in PROFILE_CONFIGS:
+            name = "balanced"
+        cfg = PROFILE_CONFIGS[name]
+        return name, float(cfg["board_weight"]), float(cfg["streak_bonus"])
 
     def _best_plan_cpp(
         self,
         bb: BitBoard,
         available: list[tuple[int, np.ndarray]],
+        streak: int,
+        board_weight: float,
+        streak_bonus: float,
+        cells_per_idx: dict[int, int],
     ) -> Optional[list[tuple[int, int, int]]]:
         if not (self.use_cpp_backend and self._cpp_available and cxx_engine is not None):
             return None
@@ -440,6 +484,7 @@ class HeuristicAgent:
             hs.append(int(h))
             ws.append(int(w))
             piece_indices.append(int(idx))
+        piece_cells = [int(cells_per_idx[idx]) for idx, _ in available]
 
         weights_vec = [float(self.weights[k]) for k in _WEIGHT_KEYS]
         cap_depth1 = int(self.depth_branch_caps.get(1, -1))
@@ -453,6 +498,7 @@ class HeuristicAgent:
                 hs=hs,
                 ws=ws,
                 piece_indices=piece_indices,
+                piece_cells=piece_cells,
                 weights=weights_vec,
                 sample_threshold=int(self.sample_threshold),
                 sample_size=int(self.sample_size),
@@ -461,6 +507,9 @@ class HeuristicAgent:
                 cap_depth1=cap_depth1,
                 cap_depth2=cap_depth2,
                 eval_cache_max=int(self.eval_cache_max),
+                initial_streak=int(streak),
+                board_weight=float(board_weight),
+                streak_bonus=float(streak_bonus),
             )
             return plan
         except Exception:
@@ -476,21 +525,23 @@ class HeuristicAgent:
         perm: list,
         use_sampling: bool,
         streak: int,
+        board_weight: float,
+        streak_bonus: float,
+        cells_per_idx: dict[int, int],
         deadline: Optional[float],
         node_budget: int,
     ) -> tuple[float, Optional[tuple], int]:
         """
         Depth-first search that returns only the best path for a permutation.
         Avoids materializing all leaves/paths in memory.
-        Uses a transposition cache keyed by (bits, depth) to reuse repeated
-        subtree results within this permutation.
+        Uses a transposition cache keyed by (bits, depth, streak) to reuse
+        repeated subtree results within this permutation.
         """
-        line_clear_reward = self.weights["line_clear"]
-        cache: dict[tuple[int, int], tuple[float, Optional[tuple]]] = {}
+        cache: dict[tuple[int, int, int], tuple[float, Optional[tuple]]] = {}
         nodes_visited = 0
         budget_exhausted = False
 
-        def dfs(cur_bb: BitBoard, depth: int) -> tuple[float, Optional[tuple]]:
+        def dfs(cur_bb: BitBoard, depth: int, cur_streak: int) -> tuple[float, Optional[tuple]]:
             nonlocal nodes_visited, budget_exhausted
             if budget_exhausted:
                 return -1e9, None
@@ -504,12 +555,13 @@ class HeuristicAgent:
                     budget_exhausted = True
                     return -1e9, None
 
-            cache_key = (cur_bb.bits, depth)
+            cache_key = (cur_bb.bits, depth, cur_streak)
             if cache_key in cache:
                 return cache[cache_key]
 
             if depth == len(perm):
-                score = self.evaluate_board(cur_bb, lines_cleared=0, streak=streak)
+                score = board_weight * self._evaluate_bits_cached(cur_bb.bits)
+                score += streak_bonus * cur_streak
                 result = (score, ())
                 cache[cache_key] = result
                 return result
@@ -528,10 +580,16 @@ class HeuristicAgent:
 
             children = self._limit_children(children, depth, use_sampling)
             for idx, row, col, lines, new_bb in children:
-                child_score, child_steps = dfs(new_bb, depth + 1)
+                cells = cells_per_idx[idx]
+                next_streak = cur_streak + 1 if lines > 0 else cur_streak
+                move_points = cells
+                if lines > 0:
+                    move_points += lines * next_streak * 10
+
+                child_score, child_steps = dfs(new_bb, depth + 1, next_streak)
                 if child_steps is None:
                     continue
-                score = child_score + (lines * line_clear_reward)
+                score = child_score + move_points
                 if score > best_score:
                     best_score = score
                     best_steps = ((idx, row, col, lines),) + child_steps
@@ -540,7 +598,7 @@ class HeuristicAgent:
             cache[cache_key] = result
             return result
 
-        score, steps = dfs(bb, 0)
+        score, steps = dfs(bb, 0, streak)
         return score, steps, nodes_visited
 
     def _limit_children(
@@ -574,8 +632,16 @@ class HeuristicAgent:
         need = cap - len(clearers)
         return clearers + non_clearers[:need]
 
-    def _best_single(self, bb: BitBoard, piece: np.ndarray, streak: int) -> tuple:
+    def _best_single(
+        self,
+        bb: BitBoard,
+        piece: np.ndarray,
+        streak: int,
+        board_weight: float,
+        streak_bonus: float,
+    ) -> tuple:
         _, _, _, shifted = get_piece_masks(piece)
+        cells = int(len(Board.get_footprint(piece)[0]))
         best_score = -1e9
         best_rc    = None
 
@@ -583,7 +649,11 @@ class HeuristicAgent:
             if not bb.can_place(mask):
                 continue
             new_bb, lines = bb.place(mask)
-            score = self.evaluate_board(new_bb, lines_cleared=lines, streak=streak)
+            next_streak = streak + 1 if lines > 0 else streak
+            points = cells
+            if lines > 0:
+                points += lines * next_streak * 10
+            score = points + board_weight * self._evaluate_bits_cached(new_bb.bits) + streak_bonus * next_streak
             if score > best_score:
                 best_score = score
                 best_rc    = (row, col)
@@ -595,6 +665,9 @@ class HeuristicAgent:
         bb: BitBoard,
         available: list[tuple[int, np.ndarray]],
         streak: int,
+        board_weight: float,
+        streak_bonus: float,
+        cells_per_idx: dict[int, int],
     ) -> list[tuple[int, int, int]]:
         """
         Build a step-by-step plan without full permutation search.
@@ -615,7 +688,11 @@ class HeuristicAgent:
                     if not current_bb.can_place(mask):
                         continue
                     new_bb, lines = current_bb.place(mask)
-                    score = self.evaluate_board(new_bb, lines_cleared=lines, streak=current_streak)
+                    next_streak = current_streak + 1 if lines > 0 else current_streak
+                    points = cells_per_idx[idx]
+                    if lines > 0:
+                        points += lines * next_streak * 10
+                    score = points + board_weight * self._evaluate_bits_cached(new_bb.bits) + streak_bonus * next_streak
                     if score > best_score:
                         best_score = score
                         best = (idx, row, col, new_bb, lines)

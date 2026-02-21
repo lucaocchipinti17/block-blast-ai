@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <random>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -55,14 +56,18 @@ struct SearchResult {
 struct StateKey {
     uint64_t bits;
     int depth;
+    int streak;
     bool operator==(const StateKey& other) const {
-        return bits == other.bits && depth == other.depth;
+        return bits == other.bits && depth == other.depth && streak == other.streak;
     }
 };
 
 struct StateKeyHash {
     std::size_t operator()(const StateKey& k) const {
-        return std::hash<uint64_t>{}(k.bits) ^ (std::hash<int>{}(k.depth) << 1);
+        std::size_t h1 = std::hash<uint64_t>{}(k.bits);
+        std::size_t h2 = std::hash<int>{}(k.depth);
+        std::size_t h3 = std::hash<int>{}(k.streak);
+        return h1 ^ (h2 << 1) ^ (h3 << 2);
     }
 };
 
@@ -342,8 +347,12 @@ struct SearchContext {
     const std::vector<uint64_t>& base_masks;
     const std::vector<int>& hs;
     const std::vector<int>& ws;
+    const std::vector<int>& piece_cells;
     const std::vector<int>& perm;
     const double* weights;
+    int initial_streak;
+    double board_weight;
+    double streak_bonus;
     bool use_sampling;
     int sample_size;
     int cap_depth1;
@@ -360,7 +369,7 @@ struct SearchContext {
     Transposition trans;
 };
 
-SearchResult dfs(SearchContext& ctx, uint64_t bits, int depth) {
+SearchResult dfs(SearchContext& ctx, uint64_t bits, int depth, int cur_streak) {
     if (ctx.exhausted) {
         return {};
     }
@@ -377,7 +386,7 @@ SearchResult dfs(SearchContext& ctx, uint64_t bits, int depth) {
         }
     }
 
-    StateKey key{bits, depth};
+    StateKey key{bits, depth, cur_streak};
     auto it = ctx.trans.find(key);
     if (it != ctx.trans.end()) {
         return it->second;
@@ -386,7 +395,8 @@ SearchResult dfs(SearchContext& ctx, uint64_t bits, int depth) {
     if (depth == static_cast<int>(ctx.perm.size())) {
         SearchResult leaf;
         leaf.valid = true;
-        leaf.score = evaluate_bits(bits, ctx.weights, ctx.eval_cache, ctx.eval_cache_max);
+        leaf.score = (ctx.board_weight * evaluate_bits(bits, ctx.weights, ctx.eval_cache, ctx.eval_cache_max))
+                   + (ctx.streak_bonus * static_cast<double>(cur_streak));
         ctx.trans.emplace(key, leaf);
         return leaf;
     }
@@ -411,11 +421,16 @@ SearchResult dfs(SearchContext& ctx, uint64_t bits, int depth) {
 
     SearchResult best;
     for (const auto& child : children) {
-        SearchResult child_res = dfs(ctx, child.bits, depth + 1);
+        int next_streak = (child.lines > 0) ? (cur_streak + 1) : cur_streak;
+        SearchResult child_res = dfs(ctx, child.bits, depth + 1, next_streak);
         if (!child_res.valid) {
             continue;
         }
-        double score = child_res.score + (child.lines * ctx.weights[W_LINE_CLEAR]);
+        double move_points = static_cast<double>(ctx.piece_cells[child.slot_idx]);
+        if (child.lines > 0) {
+            move_points += static_cast<double>(child.lines * next_streak * 10);
+        }
+        double score = child_res.score + move_points;
         if (!best.valid || score > best.score) {
             best.valid = true;
             best.score = score;
@@ -435,8 +450,12 @@ SearchResult search_perm(
     const std::vector<uint64_t>& base_masks,
     const std::vector<int>& hs,
     const std::vector<int>& ws,
+    const std::vector<int>& piece_cells,
     const std::vector<int>& perm,
     const double* weights,
+    int initial_streak,
+    double board_weight,
+    double streak_bonus,
     bool use_sampling,
     int sample_size,
     int cap_depth1,
@@ -450,13 +469,14 @@ SearchResult search_perm(
 ) {
     std::random_device rd;
     SearchContext ctx{
-        base_masks, hs, ws, perm, weights,
+        base_masks, hs, ws, piece_cells, perm, weights,
+        initial_streak, board_weight, streak_bonus,
         use_sampling, sample_size, cap_depth1, cap_depth2,
         node_budget, has_deadline, deadline,
         eval_cache_max,
         0, false, std::mt19937_64(rd()), eval_cache, {}
     };
-    SearchResult res = dfs(ctx, board_bits, 0);
+    SearchResult res = dfs(ctx, board_bits, 0, initial_streak);
     nodes_used = ctx.nodes;
     return res;
 }
@@ -466,31 +486,44 @@ std::vector<Step> greedy_fallback(
     const std::vector<uint64_t>& base_masks,
     const std::vector<int>& hs,
     const std::vector<int>& ws,
+    const std::vector<int>& piece_cells,
     const std::vector<int>& available_slots,
     const double* weights,
+    int initial_streak,
+    double board_weight,
+    double streak_bonus,
     EvalCache& eval_cache,
     int eval_cache_max
 ) {
     std::vector<Step> plan;
     std::vector<int> remaining = available_slots;
     uint64_t cur_bits = board_bits;
+    int cur_streak = initial_streak;
 
     while (!remaining.empty()) {
         bool found = false;
         double best_score = -1e18;
         Step best_step{};
         uint64_t best_bits = cur_bits;
+        int best_next_streak = cur_streak;
 
         for (int slot : remaining) {
             auto children = generate_children(cur_bits, slot, base_masks[slot], hs[slot], ws[slot]);
             for (const auto& ch : children) {
-                double s = evaluate_bits(ch.bits, weights, eval_cache, eval_cache_max)
-                         + (ch.lines * weights[W_LINE_CLEAR]);
+                int next_streak = (ch.lines > 0) ? (cur_streak + 1) : cur_streak;
+                double move_points = static_cast<double>(piece_cells[slot]);
+                if (ch.lines > 0) {
+                    move_points += static_cast<double>(ch.lines * next_streak * 10);
+                }
+                double s = move_points
+                         + (board_weight * evaluate_bits(ch.bits, weights, eval_cache, eval_cache_max))
+                         + (streak_bonus * static_cast<double>(next_streak));
                 if (!found || s > best_score) {
                     found = true;
                     best_score = s;
                     best_step = {slot, ch.row, ch.col, ch.lines};
                     best_bits = ch.bits;
+                    best_next_streak = next_streak;
                 }
             }
         }
@@ -501,6 +534,7 @@ std::vector<Step> greedy_fallback(
 
         plan.push_back(best_step);
         cur_bits = best_bits;
+        cur_streak = best_next_streak;
         remaining.erase(std::remove(remaining.begin(), remaining.end(), best_step.slot_idx), remaining.end());
     }
 
@@ -515,6 +549,7 @@ extern "C" int bb_best_plan(
     const int* hs,
     const int* ws,
     const int* piece_indices,
+    const int* piece_cells,
     int n_pieces,
     const double* weights,
     int sample_threshold,
@@ -524,6 +559,9 @@ extern "C" int bb_best_plan(
     int cap_depth1,
     int cap_depth2,
     int eval_cache_max,
+    int initial_streak,
+    double board_weight,
+    double streak_bonus,
     int* out_len,
     int* out_piece_idx,
     int* out_row,
@@ -540,6 +578,7 @@ extern "C" int bb_best_plan(
     std::vector<uint64_t> v_masks(base_masks, base_masks + n_pieces);
     std::vector<int> v_h(hs, hs + n_pieces);
     std::vector<int> v_w(ws, ws + n_pieces);
+    std::vector<int> v_piece_cells(piece_cells, piece_cells + n_pieces);
     std::vector<int> slots(n_pieces);
     for (int i = 0; i < n_pieces; ++i) {
         slots[i] = i;
@@ -602,8 +641,12 @@ extern "C" int bb_best_plan(
             v_masks,
             v_h,
             v_w,
+            v_piece_cells,
             perm,
             weights,
+            initial_streak,
+            board_weight,
+            streak_bonus,
             use_sampling,
             sample_size,
             cap_depth1,
@@ -627,7 +670,18 @@ extern "C" int bb_best_plan(
         final_steps = best.steps;
     } else {
         final_steps = greedy_fallback(
-            board_bits, v_masks, v_h, v_w, slots, weights, eval_cache, eval_cache_max
+            board_bits,
+            v_masks,
+            v_h,
+            v_w,
+            v_piece_cells,
+            slots,
+            weights,
+            initial_streak,
+            board_weight,
+            streak_bonus,
+            eval_cache,
+            eval_cache_max
         );
     }
 
@@ -645,4 +699,3 @@ extern "C" int bb_best_plan(
     }
     return 1;
 }
-

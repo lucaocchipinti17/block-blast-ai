@@ -77,7 +77,7 @@ Assumptions/uncertainties:
     ```python
     # in DFS scoring
     streak_after = streak + clears_so_far
-    score += (lines ** 2) * streak_after * POINTS_PER_LINE
+    score += lines * streak_after * POINTS_PER_LINE
     ```
 
 - `[High]` No deterministic seed path for reproducible profiling/regression runs. Evidence: random usage in `/Users/lucaocchipinti/Desktop/Professional Stuff/Solitaire/blockblast/test.py:47`, `/Users/lucaocchipinti/Desktop/Professional Stuff/Solitaire/blockblast/model.py:379`.

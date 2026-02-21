@@ -92,10 +92,9 @@ def calculate_score(
     Calculate points earned for a single placement and return
     (points_earned, new_streak).
 
-    Scoring rules (deduced from observed game data):
+    Scoring rules:
       - 1 point per cell placed, regardless of lines cleared
-      - line clear bonus = lines_cleared² × streak × 10
-      - clearing 2 lines at once is worth 4× a single line, not 2×
+      - line clear bonus = lines_cleared × streak × 10
       - streak increments by 1 each turn a line is cleared
       - streak resets to 0 only when a full round of 3 pieces
         passes without any line clear (handled in game loop)
@@ -104,7 +103,7 @@ def calculate_score(
 
     if lines_cleared > 0:
         new_streak = streak + 1
-        points += (lines_cleared ** 2) * new_streak * POINTS_PER_LINE
+        points += lines_cleared * new_streak * POINTS_PER_LINE
     else:
         new_streak = streak  # streak does not reset mid-round
 
