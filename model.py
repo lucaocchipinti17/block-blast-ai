@@ -34,7 +34,6 @@ HeuristicAgent   — search + evaluation engine
 import random
 import numpy as np
 from itertools import permutations as iter_permutations
-from functools import lru_cache
 from typing import Optional
 
 from board import Board
@@ -141,7 +140,7 @@ class BitBoard:
 
     def popcount(self) -> int:
         """Number of filled cells (set bits)."""
-        return bin(self.bits).count("1")
+        return self.bits.bit_count()
 
     def copy(self) -> "BitBoard":
         return BitBoard(self.bits)
@@ -273,12 +272,29 @@ class HeuristicAgent:
     ) -> tuple:
         """
         Return (piece_idx, row, col) for the best next placement.
+        """
+        plan = self.best_plan(board, pieces, used, streak)
+        if not plan:
+            raise ValueError("No valid moves found.")
+        return plan[0]
 
-        Converts the Board to a BitBoard once, then runs all search
-        internally on integer operations.
+    def best_plan(
+        self,
+        board: Board,
+        pieces: list,
+        used: list,
+        streak: int = 0,
+    ) -> list[tuple[int, int, int]]:
+        """
+        Return a placement plan for the current piece bank as:
+        [(piece_idx, row, col), ...]
+
+        For 2-3 available pieces, this searches permutations and placement
+        sequences while applying intermediate line clears in the simulated board
+        state. If no full path is found, falls back to a greedy step-by-step
+        plan so callers can still execute without re-running search each turn.
         """
         bb = BitBoard.from_numpy(board.board)
-
         available = [
             (i, p) for i, (p, u) in enumerate(zip(pieces, used)) if not u
         ]
@@ -288,7 +304,7 @@ class HeuristicAgent:
         if len(available) == 1:
             idx, piece = available[0]
             row, col = self._best_single(bb, piece, streak)
-            return idx, row, col
+            return [(idx, row, col)]
 
         all_perms     = list(iter_permutations(available))
         leaf_estimate = self._estimate_leaves(bb, all_perms)
@@ -298,77 +314,96 @@ class HeuristicAgent:
             mode = "sampling" if use_sampling else "exhaustive"
             print(f"  [agent] perms={len(all_perms)}  ~leaves={leaf_estimate}  mode={mode}")
 
-        best_score      = -1e9
-        best_first_move = None
+        best_score = -1e9
+        best_steps = None
 
         for perm in all_perms:
-            paths = self._search_perm(bb, perm, use_sampling)
-            for path in paths:
-                score = self._score_path(path, streak)
-                if score > best_score:
-                    best_score      = score
-                    first           = path[0]
-                    best_first_move = (perm[0][0], first[1], first[2])
+            perm_score, perm_steps = self._search_best_perm(bb, perm, use_sampling, streak)
+            if perm_steps is not None and perm_score > best_score:
+                best_score = perm_score
+                best_steps = perm_steps
 
-        if best_first_move is None:
-            idx, piece = available[0]
-            _, _, _, shifted = get_piece_masks(piece)
-            for (row, col), mask in shifted.items():
-                if bb.can_place(mask):
-                    return idx, row, col
-            raise ValueError("No valid moves found.")
+        if best_steps is not None:
+            plan = [(idx, row, col) for (idx, row, col, _) in best_steps]
+            if self.verbose:
+                print(f"  [agent] best_score={best_score:.1f}  plan={plan}")
+            return plan
 
+        # Fallback: greedy multi-step planning if no complete path exists.
+        plan = self._greedy_plan(bb, available, streak)
         if self.verbose:
-            print(f"  [agent] best_score={best_score:.1f}  move={best_first_move}")
-
-        return best_first_move
+            print(f"  [agent] fallback_greedy_plan={plan}")
+        return plan
 
     # ── Search ────────────────────────────────────────────────────────────────
 
-    def _search_perm(self, bb: BitBoard, perm: list, use_sampling: bool) -> list:
-        paths = []
-        self._recurse(bb, perm, 0, [], paths, use_sampling)
-        return paths
-
-    def _recurse(
+    def _search_best_perm(
         self,
         bb: BitBoard,
         perm: list,
-        depth: int,
-        path_so_far: list,
-        results: list,
         use_sampling: bool,
-    ):
-        if depth == len(perm):
-            results.append(path_so_far + [bb])
-            return
+        streak: int,
+    ) -> tuple[float, Optional[tuple]]:
+        """
+        Depth-first search that returns only the best path for a permutation.
+        Avoids materializing all leaves/paths in memory.
+        Uses a transposition cache keyed by (bits, depth) to reuse repeated
+        subtree results within this permutation.
+        """
+        line_clear_reward = self.weights["line_clear"]
+        cache: dict[tuple[int, int], tuple[float, Optional[tuple]]] = {}
 
-        idx, piece = perm[depth]
-        _, _, _, shifted = get_piece_masks(piece)
+        def dfs(cur_bb: BitBoard, depth: int) -> tuple[float, Optional[tuple]]:
+            cache_key = (cur_bb.bits, depth)
+            if cache_key in cache:
+                return cache[cache_key]
 
-        # All valid placements via bitwise overlap check
-        valid = [
-            (row, col) for (row, col), mask in shifted.items()
-            if bb.can_place(mask)
-        ]
+            if depth == len(perm):
+                score = self.evaluate_board(cur_bb, lines_cleared=0, streak=streak)
+                result = (score, ())
+                cache[cache_key] = result
+                return result
 
-        if not valid:
-            return
+            idx, piece = perm[depth]
+            _, _, _, shifted = get_piece_masks(piece)
+            best_score = -1e9
+            best_steps: Optional[tuple] = None
 
-        if use_sampling and depth == 0:
-            valid = random.sample(valid, min(self.sample_size, len(valid)))
+            if use_sampling and depth == 0:
+                valid = [
+                    (row, col, mask)
+                    for (row, col), mask in shifted.items()
+                    if cur_bb.can_place(mask)
+                ]
+                if len(valid) > self.sample_size:
+                    valid = random.sample(valid, self.sample_size)
+                for row, col, mask in valid:
+                    new_bb, lines = cur_bb.place(mask)
+                    child_score, child_steps = dfs(new_bb, depth + 1)
+                    if child_steps is None:
+                        continue
+                    score = child_score + (lines * line_clear_reward)
+                    if score > best_score:
+                        best_score = score
+                        best_steps = ((idx, row, col, lines),) + child_steps
+            else:
+                for (row, col), mask in shifted.items():
+                    if not cur_bb.can_place(mask):
+                        continue
+                    new_bb, lines = cur_bb.place(mask)
+                    child_score, child_steps = dfs(new_bb, depth + 1)
+                    if child_steps is None:
+                        continue
+                    score = child_score + (lines * line_clear_reward)
+                    if score > best_score:
+                        best_score = score
+                        best_steps = ((idx, row, col, lines),) + child_steps
 
-        for row, col in valid:
-            mask          = shifted[(row, col)]
-            new_bb, lines = bb.place(mask)
-            self._recurse(
-                new_bb,
-                perm,
-                depth + 1,
-                path_so_far + [(idx, row, col, lines)],
-                results,
-                use_sampling,
-            )
+            result = (best_score, best_steps)
+            cache[cache_key] = result
+            return result
+
+        return dfs(bb, 0)
 
     def _best_single(self, bb: BitBoard, piece: np.ndarray, streak: int) -> tuple:
         _, _, _, shifted = get_piece_masks(piece)
@@ -386,12 +421,49 @@ class HeuristicAgent:
 
         return best_rc or (0, 0)
 
-    # ── Scoring ───────────────────────────────────────────────────────────────
+    def _greedy_plan(
+        self,
+        bb: BitBoard,
+        available: list[tuple[int, np.ndarray]],
+        streak: int,
+    ) -> list[tuple[int, int, int]]:
+        """
+        Build a step-by-step plan without full permutation search.
+        Used as a fallback when no complete search path exists.
+        """
+        plan = []
+        remaining = available[:]
+        current_bb = bb
+        current_streak = streak
 
-    def _score_path(self, path: list, streak: int) -> float:
-        final_bb     = path[-1]
-        total_clears = sum(step[3] for step in path[:-1])
-        return self.evaluate_board(final_bb, lines_cleared=total_clears, streak=streak)
+        while remaining:
+            best = None
+            best_score = -1e9
+
+            for idx, piece in remaining:
+                _, _, _, shifted = get_piece_masks(piece)
+                for (row, col), mask in shifted.items():
+                    if not current_bb.can_place(mask):
+                        continue
+                    new_bb, lines = current_bb.place(mask)
+                    score = self.evaluate_board(new_bb, lines_cleared=lines, streak=current_streak)
+                    if score > best_score:
+                        best_score = score
+                        best = (idx, row, col, new_bb, lines)
+
+            if best is None:
+                break
+
+            idx, row, col, new_bb, lines = best
+            plan.append((idx, row, col))
+            current_bb = new_bb
+            if lines > 0:
+                current_streak += 1
+            remaining = [(i, p) for (i, p) in remaining if i != idx]
+
+        return plan
+
+    # ── Scoring ───────────────────────────────────────────────────────────────
 
     def evaluate_board(
         self,
@@ -438,9 +510,8 @@ class HeuristicAgent:
         score += lines_cleared * W["line_clear"]
 
         # ── Fragmentation penalties ───────────────────────────────────────────
-        board_arr      = bb.to_numpy()
-        empty_islands  = self._count_islands(board_arr, value=0)
-        filled_islands = self._count_islands(board_arr, value=1)
+        filled_islands = self._count_islands_bits(bits)
+        empty_islands = self._count_islands_bits((~bits) & _BOARD_MASK)
 
         score += len(empty_islands)  * W["empty_islands"]
         score += len(filled_islands) * W["filled_islands"]
@@ -475,7 +546,7 @@ class HeuristicAgent:
 
         # Cells that have at least one empty neighbour
         has_empty_neighbour = bits & ~(up & down & left & right) & _BOARD_MASK
-        return bin(has_empty_neighbour).count("1")
+        return has_empty_neighbour.bit_count()
 
     @staticmethod
     def _flood_expand(seed: int, allowed: int) -> int:
@@ -497,9 +568,9 @@ class HeuristicAgent:
         return seed
 
     @staticmethod
-    def _count_islands(board: np.ndarray, value: int) -> list:
+    def _count_islands_bits(target: int) -> list:
         """
-        Bitwise flood-fill to find connected regions of `value`.
+        Bitwise flood-fill to find connected regions from a target bitmask.
         Returns list of region sizes < 8 (large open areas are not a concern).
 
         Works on the board as a 64-bit integer: each region is found by
@@ -507,20 +578,13 @@ class HeuristicAgent:
         the target mask, recording the size, then clearing that region and
         repeating until no cells remain.
         """
-        # Build target bitmask from the numpy array
-        target = 0
-        for r in range(8):
-            for c in range(8):
-                if board[r, c] == value:
-                    target |= (1 << (r * 8 + c))
-
         remaining = target
         sizes     = []
 
         while remaining:
             seed   = remaining & (-remaining)   # isolate lowest set bit
             region = HeuristicAgent._flood_expand(seed, target)
-            size   = bin(region).count("1")
+            size   = region.bit_count()
             remaining &= ~region
             if size < 8:
                 sizes.append(size)
