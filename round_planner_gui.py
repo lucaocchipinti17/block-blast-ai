@@ -7,9 +7,7 @@ GUI round planner for Block Blast.
 Features:
 - Editable current board (8x8) via click-to-toggle cells
 - Three piece editors (5x5) via click-to-toggle cells
-- For each piece:
-  - Order label ("Move N" when planned)
-  - 8x8 preview showing where that piece will be placed
+- Three move previews (8x8), always ordered left->right as Move 1/2/3
 - Submit button runs HeuristicAgent plan for the 3 input pieces
 - Plan is applied to the current board for the next cycle
 """
@@ -106,9 +104,13 @@ class ToggleGrid(tk.Canvas):
             1: "#2b2b2b",
             2: "#ffd54f",
         }
+        self._drag_active = False
+        self._drag_seen: set[tuple[int, int]] = set()
         self._draw()
         if editable:
-            self.bind("<Button-1>", self._on_click)
+            self.bind("<ButtonPress-1>", self._on_press)
+            self.bind("<B1-Motion>", self._on_drag)
+            self.bind("<ButtonRelease-1>", self._on_release)
 
     def _draw(self) -> None:
         self.delete("all")
@@ -121,14 +123,44 @@ class ToggleGrid(tk.Canvas):
                 fill = self._fill_colors.get(int(self.grid_data[r, c]), "#2b2b2b")
                 self.create_rectangle(x0, y0, x1, y1, fill=fill, outline="#b0b0b0")
 
-    def _on_click(self, event: tk.Event) -> None:
-        if not self.editable:
-            return
+    def _cell_from_event(self, event: tk.Event) -> Optional[tuple[int, int]]:
         c = event.x // self.cell
         r = event.y // self.cell
         if 0 <= r < self.rows and 0 <= c < self.cols:
-            self.grid_data[r, c] = 0 if self.grid_data[r, c] else 1
-            self._draw()
+            return int(r), int(c)
+        return None
+
+    def _toggle_cell_once(self, r: int, c: int) -> None:
+        if (r, c) in self._drag_seen:
+            return
+        self._drag_seen.add((r, c))
+        # Toggle only editable states (0/1). Ignore preview highlight state 2.
+        self.grid_data[r, c] = 0 if self.grid_data[r, c] else 1
+        self._draw()
+
+    def _on_press(self, event: tk.Event) -> None:
+        if not self.editable:
+            return
+        self._drag_active = True
+        self._drag_seen.clear()
+        rc = self._cell_from_event(event)
+        if rc is None:
+            return
+        self._toggle_cell_once(*rc)
+
+    def _on_drag(self, event: tk.Event) -> None:
+        if not self.editable or not self._drag_active:
+            return
+        rc = self._cell_from_event(event)
+        if rc is None:
+            return
+        self._toggle_cell_once(*rc)
+
+    def _on_release(self, event: tk.Event) -> None:
+        if not self.editable:
+            return
+        self._drag_active = False
+        self._drag_seen.clear()
 
     def set_data(self, arr: np.ndarray) -> None:
         if arr.shape != self.grid_data.shape:
@@ -148,21 +180,32 @@ class PiecePanel(tk.Frame):
     def __init__(self, parent: tk.Widget, idx: int):
         super().__init__(parent, bd=1, relief=tk.GROOVE, padx=8, pady=8)
         self.idx = idx
-        self.order_var = tk.StringVar(value=f"Piece {idx + 1}: not planned")
-        self.name_var = tk.StringVar(value="shape: -")
-
-        tk.Label(self, textvariable=self.order_var, font=("Helvetica", 11, "bold")).pack()
-        self.preview = ToggleGrid(self, rows=8, cols=8, cell=14, editable=False)
-        self.preview.pack(pady=(4, 6))
-        tk.Label(self, textvariable=self.name_var, font=("Helvetica", 9)).pack()
-        tk.Label(self, text=f"Draw Piece {idx + 1} (5x5)").pack(pady=(8, 2))
+        tk.Label(self, text=f"Piece {idx + 1} Input (5x5)", font=("Helvetica", 10, "bold")).pack(pady=(0, 4))
         self.editor = ToggleGrid(self, rows=5, cols=5, cell=22, editable=True)
         self.editor.pack()
 
-    def reset_preview(self) -> None:
-        self.order_var.set(f"Piece {self.idx + 1}: not planned")
-        self.name_var.set("shape: -")
+    def clear(self) -> None:
+        self.editor.clear()
+
+
+class MovePreviewPanel(tk.Frame):
+    def __init__(self, parent: tk.Widget, move_no: int):
+        super().__init__(parent, bd=1, relief=tk.GROOVE, padx=8, pady=8)
+        self.move_no = move_no
+        self.title_var = tk.StringVar(value=f"Move {move_no}")
+        self.piece_var = tk.StringVar(value="piece: -")
+
+        tk.Label(self, textvariable=self.title_var, font=("Helvetica", 11, "bold")).pack()
+        tk.Label(self, textvariable=self.piece_var, font=("Helvetica", 9)).pack(pady=(0, 4))
+        self.preview = ToggleGrid(self, rows=8, cols=8, cell=14, editable=False)
+        self.preview.pack()
+
+    def reset(self) -> None:
+        self.piece_var.set("piece: -")
         self.preview.clear()
+
+    def set_piece_info(self, label: str) -> None:
+        self.piece_var.set(label)
 
 
 class PlannerGUI(tk.Tk):
@@ -208,7 +251,18 @@ class PlannerGUI(tk.Tk):
 
         right = tk.Frame(middle)
         right.pack(side=tk.LEFT)
-        self.panels = [PiecePanel(right, i) for i in range(3)]
+
+        tk.Label(right, text="Move Previews (left -> right execution order)", font=("Helvetica", 10, "bold")).pack(anchor="w")
+        previews_row = tk.Frame(right)
+        previews_row.pack(pady=(4, 10))
+        self.move_panels = [MovePreviewPanel(previews_row, i + 1) for i in range(3)]
+        for p in self.move_panels:
+            p.pack(side=tk.LEFT, padx=6)
+
+        tk.Label(right, text="Piece Inputs", font=("Helvetica", 10, "bold")).pack(anchor="w")
+        editors_row = tk.Frame(right)
+        editors_row.pack(pady=(4, 0))
+        self.panels = [PiecePanel(editors_row, i) for i in range(3)]
         for p in self.panels:
             p.pack(side=tk.LEFT, padx=6)
 
@@ -224,8 +278,9 @@ class PlannerGUI(tk.Tk):
 
     def _clear_piece_inputs(self) -> None:
         for p in self.panels:
-            p.editor.clear()
-            p.reset_preview()
+            p.clear()
+        for p in self.move_panels:
+            p.reset()
         self.status_var.set("Piece inputs cleared.")
 
     def _sync_board_view(self) -> None:
@@ -271,32 +326,31 @@ class PlannerGUI(tk.Tk):
 
         if self.board.is_game_over(piece_bank):
             self.status_var.set("No valid move exists for this 3-piece set.")
-            for p in self.panels:
-                p.reset_preview()
+            for p in self.move_panels:
+                p.reset()
             return
 
         plan = self.agent.best_plan(self.board, piece_bank, used, self.streak)
         if not plan:
             self.status_var.set("Agent could not find a valid plan.")
-            for p in self.panels:
-                p.reset_preview()
+            for p in self.move_panels:
+                p.reset()
             return
 
-        for p in self.panels:
-            p.reset_preview()
+        for p in self.move_panels:
+            p.reset()
 
         round_had_clear = False
         lines_out: List[str] = []
         for move_no, (piece_idx, row, col) in enumerate(plan, start=1):
-            panel = self.panels[piece_idx]
+            panel = self.move_panels[move_no - 1]
             piece = piece_bank[piece_idx]
             valid = self.board.valid_moves(piece)
             if (row, col) not in valid:
                 self.status_var.set(f"Move {move_no} became invalid; stopped.")
                 break
 
-            panel.order_var.set(f"Move {move_no}")
-            panel.name_var.set(f"shape: {resolved[piece_idx].name}")
+            panel.set_piece_info(f"piece: P{piece_idx + 1} ({resolved[piece_idx].name})")
             self._paint_preview(panel, piece, row, col)
 
             cells, _, _ = Board.get_footprint(piece)
@@ -314,7 +368,7 @@ class PlannerGUI(tk.Tk):
         # Input pieces are consumed for this round; clear editors for next round.
         if lines_out:
             for p in self.panels:
-                p.editor.clear()
+                p.clear()
 
         self._sync_board_view()
         self.status_var.set(" | ".join(lines_out) if lines_out else "No moves applied.")

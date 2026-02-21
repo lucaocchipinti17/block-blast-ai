@@ -32,11 +32,16 @@ HeuristicAgent   — search + evaluation engine
 """
 
 import random
+import time
 import numpy as np
 from itertools import permutations as iter_permutations
 from typing import Optional
 
 from board import Board
+try:
+    import cxx_engine
+except Exception:  # noqa: BLE001
+    cxx_engine = None
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -49,6 +54,10 @@ _BOARD_MASK    = (1 << 64) - 1           # all 64 bits
 
 SAMPLE_THRESHOLD = 50_000
 SAMPLE_SIZE      = 100
+PY_MAX_NODES     = 120_000
+CPP_MAX_NODES    = 1_500_000
+PY_DEPTH_CAPS    = {1: 24, 2: 12}
+CPP_DEPTH_CAPS   = {1: 64, 2: 32}
 
 # ── Default heuristic weights ─────────────────────────────────────────────────
 
@@ -66,6 +75,21 @@ DEFAULT_WEIGHTS = {
     "density":          -0.5,
     "rough_edges":      -0.5,
 }
+
+_WEIGHT_KEYS = [
+    "big_l",
+    "sq3x3",
+    "sq2x2",
+    "i5",
+    "i4",
+    "i3",
+    "line_clear",
+    "empty_islands",
+    "filled_islands",
+    "small_islands",
+    "density",
+    "rough_edges",
+]
 
 
 # ── BitBoard ──────────────────────────────────────────────────────────────────
@@ -254,11 +278,36 @@ class HeuristicAgent:
         weights: Optional[dict] = None,
         sample_threshold: int = SAMPLE_THRESHOLD,
         sample_size: int = SAMPLE_SIZE,
+        time_budget_ms: Optional[int] = 4500,
+        max_nodes: Optional[int] = None,
+        depth_branch_caps: Optional[dict[int, int]] = None,
+        eval_cache_max: int = 200_000,
+        use_cpp_backend: bool = True,
         verbose: bool = False,
     ):
         self.weights          = {**DEFAULT_WEIGHTS, **(weights or {})}
         self.sample_threshold = sample_threshold
         self.sample_size      = sample_size
+        self.time_budget_ms   = time_budget_ms
+        self.eval_cache_max   = eval_cache_max
+        self._eval_cache: dict[int, float] = {}
+        self.use_cpp_backend = use_cpp_backend
+        self._cpp_available = False
+        if use_cpp_backend and cxx_engine is not None:
+            self._cpp_available = cxx_engine.is_available()
+            if verbose and not self._cpp_available:
+                print("  [agent] C++ backend unavailable; using Python backend.")
+
+        if max_nodes is None:
+            self.max_nodes = CPP_MAX_NODES if self._cpp_available else PY_MAX_NODES
+        else:
+            self.max_nodes = max_nodes
+
+        if depth_branch_caps is None:
+            self.depth_branch_caps = CPP_DEPTH_CAPS.copy() if self._cpp_available else PY_DEPTH_CAPS.copy()
+        else:
+            self.depth_branch_caps = depth_branch_caps
+
         self.verbose          = verbose
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -306,19 +355,55 @@ class HeuristicAgent:
             row, col = self._best_single(bb, piece, streak)
             return [(idx, row, col)]
 
+        cpp_plan = self._best_plan_cpp(bb, available)
+        if cpp_plan:
+            if self.verbose:
+                print("  [agent] using C++ backend")
+            return cpp_plan
+
         all_perms     = list(iter_permutations(available))
         leaf_estimate = self._estimate_leaves(bb, all_perms)
         use_sampling  = leaf_estimate > self.sample_threshold
 
+        # Prioritize permutations with fewer first-piece placements.
+        # This typically finds strong plans faster under budgets.
+        perm_first_counts = []
+        for perm in all_perms:
+            _, _, _, shifted = get_piece_masks(perm[0][1])
+            first_n = sum(1 for mask in shifted.values() if bb.can_place(mask))
+            perm_first_counts.append((first_n, perm))
+        ordered_perms = [perm for _, perm in sorted(perm_first_counts, key=lambda x: x[0])]
+
         if self.verbose:
             mode = "sampling" if use_sampling else "exhaustive"
-            print(f"  [agent] perms={len(all_perms)}  ~leaves={leaf_estimate}  mode={mode}")
+            print(
+                f"  [agent] perms={len(all_perms)}  ~leaves={leaf_estimate}  "
+                f"mode={mode}  budget={self.time_budget_ms}ms/{self.max_nodes}nodes"
+            )
 
         best_score = -1e9
         best_steps = None
+        deadline = (
+            time.perf_counter() + (self.time_budget_ms / 1000.0)
+            if self.time_budget_ms is not None else None
+        )
+        nodes_left = self.max_nodes
 
-        for perm in all_perms:
-            perm_score, perm_steps = self._search_best_perm(bb, perm, use_sampling, streak)
+        for perm in ordered_perms:
+            if nodes_left <= 0:
+                break
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+
+            perm_score, perm_steps, nodes_used = self._search_best_perm(
+                bb,
+                perm,
+                use_sampling,
+                streak,
+                deadline=deadline,
+                node_budget=nodes_left,
+            )
+            nodes_left -= nodes_used
             if perm_steps is not None and perm_score > best_score:
                 best_score = perm_score
                 best_steps = perm_steps
@@ -326,7 +411,8 @@ class HeuristicAgent:
         if best_steps is not None:
             plan = [(idx, row, col) for (idx, row, col, _) in best_steps]
             if self.verbose:
-                print(f"  [agent] best_score={best_score:.1f}  plan={plan}")
+                used_nodes = self.max_nodes - nodes_left
+                print(f"  [agent] best_score={best_score:.1f}  plan={plan}  nodes={used_nodes}")
             return plan
 
         # Fallback: greedy multi-step planning if no complete path exists.
@@ -334,6 +420,53 @@ class HeuristicAgent:
         if self.verbose:
             print(f"  [agent] fallback_greedy_plan={plan}")
         return plan
+
+    def _best_plan_cpp(
+        self,
+        bb: BitBoard,
+        available: list[tuple[int, np.ndarray]],
+    ) -> Optional[list[tuple[int, int, int]]]:
+        if not (self.use_cpp_backend and self._cpp_available and cxx_engine is not None):
+            return None
+
+        base_masks: list[int] = []
+        hs: list[int] = []
+        ws: list[int] = []
+        piece_indices: list[int] = []
+
+        for idx, piece in available:
+            base_mask, h, w, _ = get_piece_masks(piece)
+            base_masks.append(int(base_mask))
+            hs.append(int(h))
+            ws.append(int(w))
+            piece_indices.append(int(idx))
+
+        weights_vec = [float(self.weights[k]) for k in _WEIGHT_KEYS]
+        cap_depth1 = int(self.depth_branch_caps.get(1, -1))
+        cap_depth2 = int(self.depth_branch_caps.get(2, -1))
+        time_budget_ms = int(self.time_budget_ms if self.time_budget_ms is not None else -1)
+
+        try:
+            plan = cxx_engine.best_plan_cpp(
+                board_bits=int(bb.bits),
+                base_masks=base_masks,
+                hs=hs,
+                ws=ws,
+                piece_indices=piece_indices,
+                weights=weights_vec,
+                sample_threshold=int(self.sample_threshold),
+                sample_size=int(self.sample_size),
+                time_budget_ms=time_budget_ms,
+                max_nodes=int(self.max_nodes),
+                cap_depth1=cap_depth1,
+                cap_depth2=cap_depth2,
+                eval_cache_max=int(self.eval_cache_max),
+            )
+            return plan
+        except Exception:
+            # Graceful runtime fallback to Python backend if C++ path fails.
+            self._cpp_available = False
+            return None
 
     # ── Search ────────────────────────────────────────────────────────────────
 
@@ -343,7 +476,9 @@ class HeuristicAgent:
         perm: list,
         use_sampling: bool,
         streak: int,
-    ) -> tuple[float, Optional[tuple]]:
+        deadline: Optional[float],
+        node_budget: int,
+    ) -> tuple[float, Optional[tuple], int]:
         """
         Depth-first search that returns only the best path for a permutation.
         Avoids materializing all leaves/paths in memory.
@@ -352,8 +487,23 @@ class HeuristicAgent:
         """
         line_clear_reward = self.weights["line_clear"]
         cache: dict[tuple[int, int], tuple[float, Optional[tuple]]] = {}
+        nodes_visited = 0
+        budget_exhausted = False
 
         def dfs(cur_bb: BitBoard, depth: int) -> tuple[float, Optional[tuple]]:
+            nonlocal nodes_visited, budget_exhausted
+            if budget_exhausted:
+                return -1e9, None
+
+            nodes_visited += 1
+            if nodes_visited >= node_budget:
+                budget_exhausted = True
+                return -1e9, None
+            if deadline is not None and (nodes_visited & 0xFF) == 0:
+                if time.perf_counter() >= deadline:
+                    budget_exhausted = True
+                    return -1e9, None
+
             cache_key = (cur_bb.bits, depth)
             if cache_key in cache:
                 return cache[cache_key]
@@ -369,41 +519,60 @@ class HeuristicAgent:
             best_score = -1e9
             best_steps: Optional[tuple] = None
 
-            if use_sampling and depth == 0:
-                valid = [
-                    (row, col, mask)
-                    for (row, col), mask in shifted.items()
-                    if cur_bb.can_place(mask)
-                ]
-                if len(valid) > self.sample_size:
-                    valid = random.sample(valid, self.sample_size)
-                for row, col, mask in valid:
-                    new_bb, lines = cur_bb.place(mask)
-                    child_score, child_steps = dfs(new_bb, depth + 1)
-                    if child_steps is None:
-                        continue
-                    score = child_score + (lines * line_clear_reward)
-                    if score > best_score:
-                        best_score = score
-                        best_steps = ((idx, row, col, lines),) + child_steps
-            else:
-                for (row, col), mask in shifted.items():
-                    if not cur_bb.can_place(mask):
-                        continue
-                    new_bb, lines = cur_bb.place(mask)
-                    child_score, child_steps = dfs(new_bb, depth + 1)
-                    if child_steps is None:
-                        continue
-                    score = child_score + (lines * line_clear_reward)
-                    if score > best_score:
-                        best_score = score
-                        best_steps = ((idx, row, col, lines),) + child_steps
+            children = []
+            for (row, col), mask in shifted.items():
+                if not cur_bb.can_place(mask):
+                    continue
+                new_bb, lines = cur_bb.place(mask)
+                children.append((idx, row, col, lines, new_bb))
+
+            children = self._limit_children(children, depth, use_sampling)
+            for idx, row, col, lines, new_bb in children:
+                child_score, child_steps = dfs(new_bb, depth + 1)
+                if child_steps is None:
+                    continue
+                score = child_score + (lines * line_clear_reward)
+                if score > best_score:
+                    best_score = score
+                    best_steps = ((idx, row, col, lines),) + child_steps
 
             result = (best_score, best_steps)
             cache[cache_key] = result
             return result
 
-        return dfs(bb, 0)
+        score, steps = dfs(bb, 0)
+        return score, steps, nodes_visited
+
+    def _limit_children(
+        self,
+        children: list[tuple[int, int, int, int, BitBoard]],
+        depth: int,
+        use_sampling: bool,
+    ) -> list[tuple[int, int, int, int, BitBoard]]:
+        """
+        Limit branching factor for speed. We keep line-clearing candidates first,
+        then fill remaining slots with lower-density boards.
+        """
+        if not children:
+            return children
+
+        if use_sampling and depth == 0 and len(children) > self.sample_size:
+            children = random.sample(children, self.sample_size)
+
+        cap = self.depth_branch_caps.get(depth)
+        if cap is None or len(children) <= cap:
+            return children
+
+        clearers = [c for c in children if c[3] > 0]
+        non_clearers = [c for c in children if c[3] == 0]
+
+        clearers.sort(key=lambda c: (-c[3], c[4].bits.bit_count()))
+        if len(clearers) >= cap:
+            return clearers[:cap]
+
+        non_clearers.sort(key=lambda c: c[4].bits.bit_count())
+        need = cap - len(clearers)
+        return clearers + non_clearers[:need]
 
     def _best_single(self, bb: BitBoard, piece: np.ndarray, streak: int) -> tuple:
         _, _, _, shifted = get_piece_masks(piece)
@@ -477,8 +646,17 @@ class HeuristicAgent:
         All probe-fit counting is done via bitwise AND against pre-built
         masks — no inner Python loops over the board.
         """
-        W     = self.weights
-        bits  = bb.bits
+        bits = bb.bits
+        score = self._evaluate_bits_cached(bits)
+        score += lines_cleared * self.weights["line_clear"]
+        return score
+
+    def _evaluate_bits_cached(self, bits: int) -> float:
+        cached = self._eval_cache.get(bits)
+        if cached is not None:
+            return cached
+
+        W = self.weights
         score = 0.0
 
         # ── Piece-fit flexibility ─────────────────────────────────────────────
@@ -506,9 +684,6 @@ class HeuristicAgent:
         score += i4  * W["i4"]
         score += i3  * W["i3"]
 
-        # ── Line clear reward ─────────────────────────────────────────────────
-        score += lines_cleared * W["line_clear"]
-
         # ── Fragmentation penalties ───────────────────────────────────────────
         filled_islands = self._count_islands_bits(bits)
         empty_islands = self._count_islands_bits((~bits) & _BOARD_MASK)
@@ -519,9 +694,12 @@ class HeuristicAgent:
         score += len([s for s in filled_islands if s <= 3]) * W["small_islands"]
 
         # ── Density and roughness ─────────────────────────────────────────────
-        score += bb.popcount() * W["density"]
+        score += bits.bit_count() * W["density"]
         score += self._rough_edges_bitwise(bits) * W["rough_edges"]
 
+        if len(self._eval_cache) >= self.eval_cache_max:
+            self._eval_cache.clear()
+        self._eval_cache[bits] = score
         return score
 
     # ── Board analysis ────────────────────────────────────────────────────────
