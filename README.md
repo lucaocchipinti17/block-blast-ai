@@ -17,6 +17,145 @@ This document explains how a computer agent learns to play Block Blast — not b
 | `game.py` | Game loop, scoring, streak logic |
 | `model.py` | The AI agent — searches moves, scores board states |
 | `test.py` | Runs the agent through full games and records results |
+| `stream_capture.py` | Window-located live capture loop (mss + title lookup) |
+| `piece_bank_detector.py` | Classical CV detector for 3-slot piece bank -> 5x5 matrices |
+| `live_cv_bridge.py` | Capture + detect + heuristic planning orchestration |
+| `piece_bank_cv.py` | Computer-vision piece bank detector (3 inventory slots from a frame) |
+
+---
+
+## Quick Start (New Machine)
+
+Recommended Python: `3.11` or `3.12`.
+
+```bash
+cd /path/to/blockblast
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Run the GUI:
+
+```bash
+python round_planner_gui.py
+```
+
+---
+
+## Runtime Config (`runtime_config.json`)
+
+Machine-specific live-CV settings are now in:
+
+`runtime_config.json`
+
+Default shape:
+
+```json
+{
+  "live_window_title_contains": "Movie Recording",
+  "live_bank_roi_norm_xyxy": [0.0633, 0.6945, 0.9221, 0.8135],
+  "expected_cell_px": 20.0,
+  "capture_target_fps": 20.0,
+  "capture_window_refresh_sec": 1.0
+}
+```
+
+If someone else runs this project, they should edit only this file for:
+- window title matching
+- normalized bank ROI
+- known piece cell size (currently 20 px)
+- capture loop timing
+
+---
+
+## Calibration / Verification
+
+Before first live run on a new machine, verify ROI splitting with:
+
+```bash
+python live_roi_debug.py --title "Movie Recording" --roi "0.0633,0.6945,0.9221,0.8135"
+```
+
+Expected result:
+- yellow rectangle matches the full bank ROI
+- three slot rectangles align left/middle/right piece regions
+- slot previews at the bottom show each captured region correctly
+
+Then in the GUI:
+1. Click `Attach Stream`
+2. Press `Space` each turn (`capture -> recognize -> evaluate -> display`)
+
+---
+
+## Live CV Automation Pipeline
+
+The production path for mirrored-stream automation is:
+
+1. `stream_capture.WindowCaptureLoop` continuously captures a target desktop window by title.
+2. `piece_bank_detector.PieceBankDetector` reads the configured bank ROI, splits into 3 slots, segments piece cells, and converts each slot to a 5x5 matrix.
+3. `live_cv_bridge.LiveCVPlanner` feeds those piece matrices to `HeuristicAgent` and returns move order + placements.
+4. `round_planner_gui.py` displays move previews and applies the final board state.  
+   Press `Space` in GUI after attaching stream to trigger capture -> recognize -> evaluate -> display.
+
+GUI live controls:
+- `Window title contains` (e.g. `Movie Recording`)
+- `Bank ROI norm x0,y0,x1,y1` (normalized coordinates in captured window)
+- `Attach Stream`, then press `Space` for each cycle
+
+Default ROI normalization in GUI is derived from approximate calibration:
+- Window approx: `(1028,25)` to `(1439,899)`
+- Bank ROI approx: `(1054,632)` to `(1407,736)`
+- Converted to normalized ROI and clamped robustly for proportional resizing.
+
+---
+
+## CV Piece Bank Reader (`piece_bank_cv.py`)
+
+Use this module to interpret the 3 pieces shown in a phone stream screenshot.
+
+Install dependency:
+
+```bash
+pip install -r requirements.txt
+```
+
+Run on a screenshot:
+
+```bash
+python piece_bank_cv.py --image /path/to/frame.png --show
+```
+
+If default slot regions miss your UI layout, pass explicit ROIs (`x,y,w,h`) for
+left/middle/right slots:
+
+```bash
+python piece_bank_cv.py \
+  --image /path/to/frame.png \
+  --roi 80,1260,300,420 \
+  --roi 420,1260,300,420 \
+  --roi 760,1260,300,420 \
+  --show
+```
+
+Interactive mouse ROI test (recommended for QuickTime phone mirroring):
+
+```bash
+python piece_bank_cv_test.py --screen
+```
+
+Workflow:
+- Hover the cursor over the full bank's top-left corner and press `Space`.
+- Hover over the bottom-right corner and press `Space` again.
+- Press `R` to reset corner selection, `Esc`/`Q` to cancel.
+- The script splits that region into 3 horizontal slot ROIs.
+- It prints the detected piece for each slot as a 5×5 array in terminal.
+
+Continuous scanning mode with same selected ROI:
+
+```bash
+python piece_bank_cv_test.py --screen --watch --interval 0.75
+```
 
 ---
 

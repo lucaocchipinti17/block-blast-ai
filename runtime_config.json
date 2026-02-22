@@ -1,0 +1,7 @@
+{
+  "live_window_title_contains": "Movie Recording",
+  "live_bank_roi_norm_xyxy": [0.0633, 0.6945, 0.9221, 0.8135],
+  "expected_cell_px": 20.0,
+  "capture_target_fps": 20.0,
+  "capture_window_refresh_sec": 1.0
+}

@@ -1,0 +1,4 @@
+numpy>=1.24
+opencv-python>=4.8
+mss>=9.0
+pygetwindow>=0.0.9
