@@ -58,6 +58,7 @@ PY_MAX_NODES     = 120_000
 CPP_MAX_NODES    = 1_500_000
 PY_DEPTH_CAPS    = {1: 24, 2: 12}
 CPP_DEPTH_CAPS   = {1: 64, 2: 32}
+STREAK_CLEAR_WINDOW = 3
 
 # ── Default heuristic weights ─────────────────────────────────────────────────
 
@@ -326,12 +327,20 @@ class HeuristicAgent:
         pieces: list,
         used: list,
         streak: int = 0,
+        moves_since_clear: int = STREAK_CLEAR_WINDOW,
         profile: Optional[str] = None,
     ) -> tuple:
         """
         Return (piece_idx, row, col) for the best next placement.
         """
-        plan = self.best_plan(board, pieces, used, streak, profile=profile)
+        plan = self.best_plan(
+            board,
+            pieces,
+            used,
+            streak,
+            moves_since_clear=moves_since_clear,
+            profile=profile,
+        )
         if not plan:
             raise ValueError("No valid moves found.")
         return plan[0]
@@ -342,6 +351,7 @@ class HeuristicAgent:
         pieces: list,
         used: list,
         streak: int = 0,
+        moves_since_clear: int = STREAK_CLEAR_WINDOW,
         profile: Optional[str] = None,
     ) -> list[tuple[int, int, int]]:
         """
@@ -363,7 +373,14 @@ class HeuristicAgent:
 
         if len(available) == 1:
             idx, piece = available[0]
-            row, col = self._best_single(bb, piece, streak, board_weight, streak_bonus)
+            row, col = self._best_single(
+                bb,
+                piece,
+                streak,
+                moves_since_clear,
+                board_weight,
+                streak_bonus,
+            )
             return [(idx, row, col)]
 
         cells_per_idx = {}
@@ -374,6 +391,7 @@ class HeuristicAgent:
             bb=bb,
             available=available,
             streak=streak,
+            moves_since_clear=moves_since_clear,
             board_weight=board_weight,
             streak_bonus=streak_bonus,
             cells_per_idx=cells_per_idx,
@@ -423,6 +441,7 @@ class HeuristicAgent:
                 perm,
                 use_sampling,
                 streak,
+                moves_since_clear,
                 board_weight,
                 streak_bonus,
                 cells_per_idx,
@@ -446,6 +465,7 @@ class HeuristicAgent:
             bb=bb,
             available=available,
             streak=streak,
+            moves_since_clear=moves_since_clear,
             board_weight=board_weight,
             streak_bonus=streak_bonus,
             cells_per_idx=cells_per_idx,
@@ -461,11 +481,32 @@ class HeuristicAgent:
         cfg = PROFILE_CONFIGS[name]
         return name, float(cfg["board_weight"]), float(cfg["streak_bonus"])
 
+    @staticmethod
+    def _advance_streak_state(
+        streak: int,
+        moves_since_clear: int,
+        lines_cleared: int,
+    ) -> tuple[int, int]:
+        """
+        Advance streak state using a 3-move streak window.
+        A line clear continues the streak only if the previous clear was <=3 moves ago.
+        """
+        if lines_cleared > 0:
+            if streak > 0 and moves_since_clear < STREAK_CLEAR_WINDOW:
+                return streak + 1, 0
+            return 1, 0
+
+        next_gap = min(STREAK_CLEAR_WINDOW, max(0, moves_since_clear) + 1)
+        if streak > 0 and next_gap < STREAK_CLEAR_WINDOW:
+            return streak, next_gap
+        return 0, next_gap
+
     def _best_plan_cpp(
         self,
         bb: BitBoard,
         available: list[tuple[int, np.ndarray]],
         streak: int,
+        moves_since_clear: int,
         board_weight: float,
         streak_bonus: float,
         cells_per_idx: dict[int, int],
@@ -508,6 +549,7 @@ class HeuristicAgent:
                 cap_depth2=cap_depth2,
                 eval_cache_max=int(self.eval_cache_max),
                 initial_streak=int(streak),
+                initial_moves_since_clear=int(max(0, moves_since_clear)),
                 board_weight=float(board_weight),
                 streak_bonus=float(streak_bonus),
             )
@@ -525,6 +567,7 @@ class HeuristicAgent:
         perm: list,
         use_sampling: bool,
         streak: int,
+        moves_since_clear: int,
         board_weight: float,
         streak_bonus: float,
         cells_per_idx: dict[int, int],
@@ -537,11 +580,16 @@ class HeuristicAgent:
         Uses a transposition cache keyed by (bits, depth, streak) to reuse
         repeated subtree results within this permutation.
         """
-        cache: dict[tuple[int, int, int], tuple[float, Optional[tuple]]] = {}
+        cache: dict[tuple[int, int, int, int], tuple[float, Optional[tuple]]] = {}
         nodes_visited = 0
         budget_exhausted = False
 
-        def dfs(cur_bb: BitBoard, depth: int, cur_streak: int) -> tuple[float, Optional[tuple]]:
+        def dfs(
+            cur_bb: BitBoard,
+            depth: int,
+            cur_streak: int,
+            cur_moves_since_clear: int,
+        ) -> tuple[float, Optional[tuple]]:
             nonlocal nodes_visited, budget_exhausted
             if budget_exhausted:
                 return -1e9, None
@@ -555,7 +603,7 @@ class HeuristicAgent:
                     budget_exhausted = True
                     return -1e9, None
 
-            cache_key = (cur_bb.bits, depth, cur_streak)
+            cache_key = (cur_bb.bits, depth, cur_streak, cur_moves_since_clear)
             if cache_key in cache:
                 return cache[cache_key]
 
@@ -581,12 +629,21 @@ class HeuristicAgent:
             children = self._limit_children(children, depth, use_sampling)
             for idx, row, col, lines, new_bb in children:
                 cells = cells_per_idx[idx]
-                next_streak = cur_streak + 1 if lines > 0 else cur_streak
+                next_streak, next_moves_since_clear = self._advance_streak_state(
+                    cur_streak,
+                    cur_moves_since_clear,
+                    lines,
+                )
                 move_points = cells
                 if lines > 0:
                     move_points += lines * next_streak * 10
 
-                child_score, child_steps = dfs(new_bb, depth + 1, next_streak)
+                child_score, child_steps = dfs(
+                    new_bb,
+                    depth + 1,
+                    next_streak,
+                    next_moves_since_clear,
+                )
                 if child_steps is None:
                     continue
                 score = child_score + move_points
@@ -598,7 +655,7 @@ class HeuristicAgent:
             cache[cache_key] = result
             return result
 
-        score, steps = dfs(bb, 0, streak)
+        score, steps = dfs(bb, 0, streak, moves_since_clear)
         return score, steps, nodes_visited
 
     def _limit_children(
@@ -637,6 +694,7 @@ class HeuristicAgent:
         bb: BitBoard,
         piece: np.ndarray,
         streak: int,
+        moves_since_clear: int,
         board_weight: float,
         streak_bonus: float,
     ) -> tuple:
@@ -649,7 +707,7 @@ class HeuristicAgent:
             if not bb.can_place(mask):
                 continue
             new_bb, lines = bb.place(mask)
-            next_streak = streak + 1 if lines > 0 else streak
+            next_streak, _ = self._advance_streak_state(streak, moves_since_clear, lines)
             points = cells
             if lines > 0:
                 points += lines * next_streak * 10
@@ -665,6 +723,7 @@ class HeuristicAgent:
         bb: BitBoard,
         available: list[tuple[int, np.ndarray]],
         streak: int,
+        moves_since_clear: int,
         board_weight: float,
         streak_bonus: float,
         cells_per_idx: dict[int, int],
@@ -677,6 +736,7 @@ class HeuristicAgent:
         remaining = available[:]
         current_bb = bb
         current_streak = streak
+        current_moves_since_clear = moves_since_clear
 
         while remaining:
             best = None
@@ -688,23 +748,27 @@ class HeuristicAgent:
                     if not current_bb.can_place(mask):
                         continue
                     new_bb, lines = current_bb.place(mask)
-                    next_streak = current_streak + 1 if lines > 0 else current_streak
+                    next_streak, next_moves_since_clear = self._advance_streak_state(
+                        current_streak,
+                        current_moves_since_clear,
+                        lines,
+                    )
                     points = cells_per_idx[idx]
                     if lines > 0:
                         points += lines * next_streak * 10
                     score = points + board_weight * self._evaluate_bits_cached(new_bb.bits) + streak_bonus * next_streak
                     if score > best_score:
                         best_score = score
-                        best = (idx, row, col, new_bb, lines)
+                        best = (idx, row, col, new_bb, lines, next_streak, next_moves_since_clear)
 
             if best is None:
                 break
 
-            idx, row, col, new_bb, lines = best
+            idx, row, col, new_bb, lines, next_streak, next_moves_since_clear = best
             plan.append((idx, row, col))
             current_bb = new_bb
-            if lines > 0:
-                current_streak += 1
+            current_streak = next_streak
+            current_moves_since_clear = next_moves_since_clear
             remaining = [(i, p) for (i, p) in remaining if i != idx]
 
         return plan

@@ -17,6 +17,7 @@ from pieces import ALL_PIECES
 
 POINTS_PER_CELL = 1   # points per cell placed
 POINTS_PER_LINE = 10  # base points per line cleared, multiplied by current streak
+STREAK_CLEAR_WINDOW = 3  # streak continues only if next clear happens within 3 moves
 
 
 # ── Terminal display helpers ──────────────────────────────────────────────────
@@ -87,27 +88,32 @@ def calculate_score(
     cells_placed: int,
     lines_cleared: int,
     streak: int,
-) -> tuple[int, int]:
+    moves_since_clear: int,
+) -> tuple[int, int, int]:
     """
     Calculate points earned for a single placement and return
-    (points_earned, new_streak).
+    (points_earned, new_streak, new_moves_since_clear).
 
     Scoring rules:
       - 1 point per cell placed, regardless of lines cleared
-      - line clear bonus = lines_cleared × streak × 10
-      - streak increments by 1 each turn a line is cleared
-      - streak resets to 0 only when a full round of 3 pieces
-        passes without any line clear (handled in game loop)
+      - line clear bonus = lines_cleared × new_streak × 10
+      - streak increments only if this clear happens within 3 moves
+        of the previous line clear; otherwise it restarts at 1
     """
     points = cells_placed * POINTS_PER_CELL
 
     if lines_cleared > 0:
-        new_streak = streak + 1
+        if streak > 0 and moves_since_clear < STREAK_CLEAR_WINDOW:
+            new_streak = streak + 1
+        else:
+            new_streak = 1
+        new_moves_since_clear = 0
         points += lines_cleared * new_streak * POINTS_PER_LINE
     else:
-        new_streak = streak  # streak does not reset mid-round
+        new_moves_since_clear = min(STREAK_CLEAR_WINDOW, max(0, moves_since_clear) + 1)
+        new_streak = streak if new_moves_since_clear < STREAK_CLEAR_WINDOW else 0
 
-    return points, new_streak
+    return points, new_streak, new_moves_since_clear
 
 
 # ── Input helpers ─────────────────────────────────────────────────────────────
@@ -164,11 +170,11 @@ class BlockBlastGame:
         self.board      = Board()
         self.score      = 0
         self.streak     = 0
+        self.moves_since_clear = STREAK_CLEAR_WINDOW
         self.turn       = 0
         self.piece_pool = piece_pool or ALL_PIECES  # dict of name -> array
         self.piece_bank : list[Optional[np.ndarray]] = []
         self.used       : list[bool] = []
-        self._round_had_clear : bool = False  # did any placement this round clear a line?
 
     # ── Piece bank ────────────────────────────────────────────────────────────
 
@@ -213,12 +219,13 @@ class BlockBlastGame:
         lines_cleared = self.board.apply_move(piece, row, col)
 
         # Update score and streak
-        points, self.streak = calculate_score(cells_placed, lines_cleared, self.streak)
+        points, self.streak, self.moves_since_clear = calculate_score(
+            cells_placed,
+            lines_cleared,
+            self.streak,
+            self.moves_since_clear,
+        )
         self.score += points
-
-        # Track whether any line was cleared this round
-        if lines_cleared > 0:
-            self._round_had_clear = True
 
         # Mark piece as used
         self.used[piece_idx] = True
@@ -238,10 +245,6 @@ class BlockBlastGame:
         while True:
             # Draw a new bank when the previous one is exhausted
             if self._bank_exhausted() or self.turn == 0:
-                # Reset streak if the completed round had no line clears
-                if self.turn > 0 and not self._round_had_clear:
-                    self.streak = 0
-                self._round_had_clear = False
                 self._draw_piece_bank()
 
             # Check if any piece can be placed — if not, game over

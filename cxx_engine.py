@@ -64,6 +64,7 @@ def _ensure_loaded() -> ctypes.CDLL:
             ctypes.c_int,                           # cap_depth2
             ctypes.c_int,                           # eval_cache_max
             ctypes.c_int,                           # initial_streak
+            ctypes.c_int,                           # initial_moves_since_clear
             ctypes.c_double,                        # board_weight
             ctypes.c_double,                        # streak_bonus
             ctypes.POINTER(ctypes.c_int),           # out_len
@@ -103,6 +104,7 @@ def best_plan_cpp(
     cap_depth2: int,
     eval_cache_max: int,
     initial_streak: int,
+    initial_moves_since_clear: int,
     board_weight: float,
     streak_bonus: float,
 ) -> Optional[list[tuple[int, int, int]]]:
@@ -141,6 +143,7 @@ def best_plan_cpp(
         ctypes.c_int(cap_depth2),
         ctypes.c_int(eval_cache_max),
         ctypes.c_int(initial_streak),
+        ctypes.c_int(initial_moves_since_clear),
         ctypes.c_double(board_weight),
         ctypes.c_double(streak_bonus),
         ctypes.byref(out_len),

@@ -24,7 +24,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from board import Board
-from game import calculate_score
+from game import STREAK_CLEAR_WINDOW, calculate_score
 from model import HeuristicAgent
 from pieces import ALL_PIECES
 
@@ -186,6 +186,7 @@ def main() -> None:
 
     score = 0
     streak = 0
+    moves_since_clear = STREAK_CLEAR_WINDOW
     round_no = 0
 
     print("\nPlanner ready. Type Ctrl+C to quit.")
@@ -215,13 +216,18 @@ def main() -> None:
             print("\nNo valid move exists for this 3-piece bank. Game over state reached.")
             break
 
-        plan = agent.best_plan(board, piece_bank, used, streak)
+        plan = agent.best_plan(
+            board,
+            piece_bank,
+            used,
+            streak=streak,
+            moves_since_clear=moves_since_clear,
+        )
         if not plan:
             print("\nAgent could not find a valid plan.")
             break
 
         move_plan_output: List[Tuple[int, int, int, int]] = []
-        round_had_clear = False
         for step_no, (piece_idx, row, col) in enumerate(plan, start=1):
             piece = piece_bank[piece_idx]
             valid = board.valid_moves(piece)
@@ -233,11 +239,14 @@ def main() -> None:
             move_plan_output.append((step_no, piece_idx + 1, row + 1, col + 1))
             cells, _, _ = Board.get_footprint(piece)
             lines = board.apply_move(piece, row, col)
-            points, streak = calculate_score(len(cells), lines, streak)
+            points, streak, moves_since_clear = calculate_score(
+                len(cells),
+                lines,
+                streak,
+                moves_since_clear,
+            )
             score += points
             used[piece_idx] = True
-            if lines > 0:
-                round_had_clear = True
 
             if args.verbose:
                 print(
@@ -248,9 +257,6 @@ def main() -> None:
 
         for m, p, r, c in move_plan_output:
             print(f"Move {m}: (P{p}), ({r}, {c})")
-
-        if not round_had_clear:
-            streak = 0
 
         if args.show_board:
             print("\nBoard after round:")

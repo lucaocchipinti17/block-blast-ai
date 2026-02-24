@@ -15,6 +15,7 @@ constexpr uint64_t FULL_COL_BASE = 0x0101010101010101ULL;
 constexpr uint64_t LEFT_MASK = 0xFEFEFEFEFEFEFEFEULL;
 constexpr uint64_t RIGHT_MASK = 0x7F7F7F7F7F7F7F7FULL;
 constexpr uint64_t BOARD_MASK = 0xFFFFFFFFFFFFFFFFULL;
+constexpr int STREAK_CLEAR_WINDOW = 3;
 
 enum WeightIdx {
     W_BIG_L = 0,
@@ -57,8 +58,12 @@ struct StateKey {
     uint64_t bits;
     int depth;
     int streak;
+    int moves_since_clear;
     bool operator==(const StateKey& other) const {
-        return bits == other.bits && depth == other.depth && streak == other.streak;
+        return bits == other.bits
+            && depth == other.depth
+            && streak == other.streak
+            && moves_since_clear == other.moves_since_clear;
     }
 };
 
@@ -67,7 +72,8 @@ struct StateKeyHash {
         std::size_t h1 = std::hash<uint64_t>{}(k.bits);
         std::size_t h2 = std::hash<int>{}(k.depth);
         std::size_t h3 = std::hash<int>{}(k.streak);
-        return h1 ^ (h2 << 1) ^ (h3 << 2);
+        std::size_t h4 = std::hash<int>{}(k.moves_since_clear);
+        return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3);
     }
 };
 
@@ -351,6 +357,7 @@ struct SearchContext {
     const std::vector<int>& perm;
     const double* weights;
     int initial_streak;
+    int initial_moves_since_clear;
     double board_weight;
     double streak_bonus;
     bool use_sampling;
@@ -369,7 +376,28 @@ struct SearchContext {
     Transposition trans;
 };
 
-SearchResult dfs(SearchContext& ctx, uint64_t bits, int depth, int cur_streak) {
+inline std::pair<int, int> advance_streak_state(int streak, int moves_since_clear, int lines_cleared) {
+    if (lines_cleared > 0) {
+        if (streak > 0 && moves_since_clear < STREAK_CLEAR_WINDOW) {
+            return {streak + 1, 0};
+        }
+        return {1, 0};
+    }
+
+    int next_gap = std::min(STREAK_CLEAR_WINDOW, std::max(0, moves_since_clear) + 1);
+    if (streak > 0 && next_gap < STREAK_CLEAR_WINDOW) {
+        return {streak, next_gap};
+    }
+    return {0, next_gap};
+}
+
+SearchResult dfs(
+    SearchContext& ctx,
+    uint64_t bits,
+    int depth,
+    int cur_streak,
+    int cur_moves_since_clear
+) {
     if (ctx.exhausted) {
         return {};
     }
@@ -386,7 +414,7 @@ SearchResult dfs(SearchContext& ctx, uint64_t bits, int depth, int cur_streak) {
         }
     }
 
-    StateKey key{bits, depth, cur_streak};
+    StateKey key{bits, depth, cur_streak, cur_moves_since_clear};
     auto it = ctx.trans.find(key);
     if (it != ctx.trans.end()) {
         return it->second;
@@ -421,8 +449,12 @@ SearchResult dfs(SearchContext& ctx, uint64_t bits, int depth, int cur_streak) {
 
     SearchResult best;
     for (const auto& child : children) {
-        int next_streak = (child.lines > 0) ? (cur_streak + 1) : cur_streak;
-        SearchResult child_res = dfs(ctx, child.bits, depth + 1, next_streak);
+        auto [next_streak, next_moves_since_clear] = advance_streak_state(
+            cur_streak,
+            cur_moves_since_clear,
+            child.lines
+        );
+        SearchResult child_res = dfs(ctx, child.bits, depth + 1, next_streak, next_moves_since_clear);
         if (!child_res.valid) {
             continue;
         }
@@ -454,6 +486,7 @@ SearchResult search_perm(
     const std::vector<int>& perm,
     const double* weights,
     int initial_streak,
+    int initial_moves_since_clear,
     double board_weight,
     double streak_bonus,
     bool use_sampling,
@@ -470,13 +503,13 @@ SearchResult search_perm(
     std::random_device rd;
     SearchContext ctx{
         base_masks, hs, ws, piece_cells, perm, weights,
-        initial_streak, board_weight, streak_bonus,
+        initial_streak, initial_moves_since_clear, board_weight, streak_bonus,
         use_sampling, sample_size, cap_depth1, cap_depth2,
         node_budget, has_deadline, deadline,
         eval_cache_max,
         0, false, std::mt19937_64(rd()), eval_cache, {}
     };
-    SearchResult res = dfs(ctx, board_bits, 0, initial_streak);
+    SearchResult res = dfs(ctx, board_bits, 0, initial_streak, initial_moves_since_clear);
     nodes_used = ctx.nodes;
     return res;
 }
@@ -490,6 +523,7 @@ std::vector<Step> greedy_fallback(
     const std::vector<int>& available_slots,
     const double* weights,
     int initial_streak,
+    int initial_moves_since_clear,
     double board_weight,
     double streak_bonus,
     EvalCache& eval_cache,
@@ -499,6 +533,7 @@ std::vector<Step> greedy_fallback(
     std::vector<int> remaining = available_slots;
     uint64_t cur_bits = board_bits;
     int cur_streak = initial_streak;
+    int cur_moves_since_clear = initial_moves_since_clear;
 
     while (!remaining.empty()) {
         bool found = false;
@@ -506,11 +541,16 @@ std::vector<Step> greedy_fallback(
         Step best_step{};
         uint64_t best_bits = cur_bits;
         int best_next_streak = cur_streak;
+        int best_next_moves_since_clear = cur_moves_since_clear;
 
         for (int slot : remaining) {
             auto children = generate_children(cur_bits, slot, base_masks[slot], hs[slot], ws[slot]);
             for (const auto& ch : children) {
-                int next_streak = (ch.lines > 0) ? (cur_streak + 1) : cur_streak;
+                auto [next_streak, next_moves_since_clear] = advance_streak_state(
+                    cur_streak,
+                    cur_moves_since_clear,
+                    ch.lines
+                );
                 double move_points = static_cast<double>(piece_cells[slot]);
                 if (ch.lines > 0) {
                     move_points += static_cast<double>(ch.lines * next_streak * 10);
@@ -524,6 +564,7 @@ std::vector<Step> greedy_fallback(
                     best_step = {slot, ch.row, ch.col, ch.lines};
                     best_bits = ch.bits;
                     best_next_streak = next_streak;
+                    best_next_moves_since_clear = next_moves_since_clear;
                 }
             }
         }
@@ -535,6 +576,7 @@ std::vector<Step> greedy_fallback(
         plan.push_back(best_step);
         cur_bits = best_bits;
         cur_streak = best_next_streak;
+        cur_moves_since_clear = best_next_moves_since_clear;
         remaining.erase(std::remove(remaining.begin(), remaining.end(), best_step.slot_idx), remaining.end());
     }
 
@@ -560,6 +602,7 @@ extern "C" int bb_best_plan(
     int cap_depth2,
     int eval_cache_max,
     int initial_streak,
+    int initial_moves_since_clear,
     double board_weight,
     double streak_bonus,
     int* out_len,
@@ -645,6 +688,7 @@ extern "C" int bb_best_plan(
             perm,
             weights,
             initial_streak,
+            initial_moves_since_clear,
             board_weight,
             streak_bonus,
             use_sampling,
@@ -678,6 +722,7 @@ extern "C" int bb_best_plan(
             slots,
             weights,
             initial_streak,
+            initial_moves_since_clear,
             board_weight,
             streak_bonus,
             eval_cache,

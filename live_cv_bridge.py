@@ -61,7 +61,13 @@ class LiveCVPlanner:
     def stop(self) -> None:
         self.capture.stop()
 
-    def process_once(self, board: Board, streak: int, profile: str = "balanced") -> LivePlanResult:
+    def process_once(
+        self,
+        board: Board,
+        streak: int,
+        moves_since_clear: int,
+        profile: str = "balanced",
+    ) -> LivePlanResult:
         t0 = time.perf_counter()
 
         frame = self.capture.get_latest_frame(copy=True)
@@ -79,7 +85,14 @@ class LiveCVPlanner:
         if board.is_game_over(piece_bank):
             raise RuntimeError("Detected piece bank has no valid moves on current board.")
 
-        plan = self.agent.best_plan(board, piece_bank, used, streak=streak, profile=profile)
+        plan = self.agent.best_plan(
+            board,
+            piece_bank,
+            used,
+            streak=streak,
+            moves_since_clear=moves_since_clear,
+            profile=profile,
+        )
         total_ms = (time.perf_counter() - t0) * 1000.0
         return LivePlanResult(
             detection=detection,

@@ -22,7 +22,7 @@ import numpy as np
 
 from board import Board
 from pieces import ALL_PIECES
-from game import calculate_score
+from game import STREAK_CLEAR_WINDOW, calculate_score
 from model import HeuristicAgent
 
 
@@ -37,9 +37,9 @@ def run_game(agent: HeuristicAgent, piece_pool: dict, verbose: bool = False) -> 
     board  = Board()
     score  = 0
     streak = 0
+    moves_since_clear = STREAK_CLEAR_WINDOW
     turn   = 0
     round_ = 0
-    round_had_clear = False
     t_start = time.time()
 
     while True:
@@ -53,10 +53,14 @@ def run_game(agent: HeuristicAgent, piece_pool: dict, verbose: bool = False) -> 
         if board.is_game_over(piece_bank):
             break
 
-        round_had_clear = False
-
         # ── Compute and execute a full round plan ─────────────────────────────
-        plan = agent.best_plan(board, piece_bank, used, streak)
+        plan = agent.best_plan(
+            board,
+            piece_bank,
+            used,
+            streak=streak,
+            moves_since_clear=moves_since_clear,
+        )
 
         for piece_idx, row, col in plan:
             # If board has changed in an unexpected way, stop the round safely.
@@ -74,12 +78,14 @@ def run_game(agent: HeuristicAgent, piece_pool: dict, verbose: bool = False) -> 
             lines_cleared = board.apply_move(piece, row, col)
 
             # Score
-            points, streak = calculate_score(cells_placed, lines_cleared, streak)
+            points, streak, moves_since_clear = calculate_score(
+                cells_placed,
+                lines_cleared,
+                streak,
+                moves_since_clear,
+            )
             score += points
             turn  += 1
-
-            if lines_cleared > 0:
-                round_had_clear = True
 
             used[piece_idx] = True
 
@@ -87,12 +93,6 @@ def run_game(agent: HeuristicAgent, piece_pool: dict, verbose: bool = False) -> 
                 print(f"  R{round_:3d} T{turn:4d} | piece={names[piece_idx]:12s} "
                       f"({row},{col}) | lines={lines_cleared} | "
                       f"+{points:4d} | score={score:6d} | streak={streak}")
-        print(board)
-
-        # ── End of round: reset streak if no clears ───────────────────────────
-        if not round_had_clear:
-            streak = 0
-
         # ── Game over check after placing ─────────────────────────────────────
         # Re-draw to check if next bank would be stuck
         next_names = random.choices(list(piece_pool.keys()), k=3)

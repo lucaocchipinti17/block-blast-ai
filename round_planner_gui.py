@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from board import Board
-from game import calculate_score
+from game import STREAK_CLEAR_WINDOW, calculate_score
 from live_cv_bridge import LiveCVConfig, LiveCVPlanner
 from model import HeuristicAgent
 from piece_bank_detector import PieceBankDetectorConfig
@@ -158,6 +158,7 @@ DEFAULT_RUNTIME_CONFIG = {
     "expected_cell_px": 20.0,
     "capture_target_fps": 20.0,
     "capture_window_refresh_sec": 1.0,
+    "live_trigger_keybind": "<F8>",
 }
 
 
@@ -204,6 +205,15 @@ def load_runtime_config(path: Path = RUNTIME_CONFIG_PATH) -> dict:
         if val <= 0:
             raise RuntimeError(f"{key} must be > 0.")
         cfg[key] = val
+
+    trigger_key = raw.get("live_trigger_keybind")
+    if trigger_key is not None:
+        if not isinstance(trigger_key, str) or not trigger_key.strip():
+            raise RuntimeError("live_trigger_keybind must be a non-empty string (e.g. '<F8>' or '<Return>').")
+        trigger_norm = trigger_key.strip()
+        if not (trigger_norm.startswith("<") and trigger_norm.endswith(">")):
+            trigger_norm = f"<{trigger_norm}>"
+        cfg["live_trigger_keybind"] = trigger_norm
 
     return cfg
 
@@ -312,10 +322,10 @@ class ToggleGrid(tk.Canvas):
 
 class PiecePanel(tk.Frame):
     def __init__(self, parent: tk.Widget, idx: int):
-        super().__init__(parent, bd=1, relief=tk.GROOVE, padx=8, pady=8)
+        super().__init__(parent, bd=1, relief=tk.GROOVE, padx=6, pady=6)
         self.idx = idx
         tk.Label(self, text=f"Piece {idx + 1} Input (5x5)", font=("Helvetica", 10, "bold")).pack(pady=(0, 4))
-        self.editor = ToggleGrid(self, rows=5, cols=5, cell=22, editable=True)
+        self.editor = ToggleGrid(self, rows=5, cols=5, cell=18, editable=True)
         self.editor.pack()
 
     def clear(self) -> None:
@@ -324,14 +334,14 @@ class PiecePanel(tk.Frame):
 
 class MovePreviewPanel(tk.Frame):
     def __init__(self, parent: tk.Widget, move_no: int):
-        super().__init__(parent, bd=1, relief=tk.GROOVE, padx=8, pady=8)
+        super().__init__(parent, bd=1, relief=tk.GROOVE, padx=6, pady=6)
         self.move_no = move_no
         self.title_var = tk.StringVar(value=f"Move {move_no}")
         self.piece_var = tk.StringVar(value="piece: -")
 
         tk.Label(self, textvariable=self.title_var, font=("Helvetica", 11, "bold")).pack()
         tk.Label(self, textvariable=self.piece_var, font=("Helvetica", 9)).pack(pady=(0, 4))
-        self.preview = ToggleGrid(self, rows=8, cols=8, cell=14, editable=False)
+        self.preview = ToggleGrid(self, rows=8, cols=8, cell=12, editable=False)
         self.preview.pack()
 
     def reset(self) -> None:
@@ -353,6 +363,7 @@ class PlannerGUI(tk.Tk):
         self.board = Board()
         self.score = 0
         self.streak = 0
+        self.moves_since_clear = STREAK_CLEAR_WINDOW
 
         self.timer_total_seconds = 6 * 60
         self.timer_remaining_seconds = self.timer_total_seconds
@@ -378,6 +389,7 @@ class PlannerGUI(tk.Tk):
         self.live_expected_cell_px = float(self.runtime_config["expected_cell_px"])
         self.live_capture_target_fps = float(self.runtime_config["capture_target_fps"])
         self.live_capture_window_refresh_sec = float(self.runtime_config["capture_window_refresh_sec"])
+        self.live_trigger_keybind = str(self.runtime_config["live_trigger_keybind"])
 
         self.status_var = tk.StringVar(value="Draw board/pieces, then click Submit.")
         self.score_var = tk.StringVar(value="Score: 0   Streak: 0")
@@ -388,11 +400,11 @@ class PlannerGUI(tk.Tk):
         self._sync_board_view()
         self._refresh_profile_label()
         self.live_status_var.set(f"Live stream: detached (config={RUNTIME_CONFIG_PATH.name})")
-        self.bind("<space>", self._on_space_trigger)
+        self.bind_all(self.live_trigger_keybind, self._on_live_trigger)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_layout(self) -> None:
-        root = tk.Frame(self, padx=10, pady=10)
+        root = tk.Frame(self, padx=8, pady=8)
         root.pack()
 
         top = tk.Frame(root)
@@ -400,7 +412,13 @@ class PlannerGUI(tk.Tk):
         top_left = tk.Frame(top)
         top_left.pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Label(top_left, textvariable=self.score_var, font=("Helvetica", 11, "bold")).pack(side=tk.LEFT)
-        tk.Label(top_left, textvariable=self.status_var, fg="#2a4d8f").pack(side=tk.LEFT, padx=12)
+        tk.Label(
+            top_left,
+            textvariable=self.status_var,
+            fg="#2a4d8f",
+            justify="left",
+            wraplength=430,
+        ).pack(side=tk.LEFT, padx=10)
 
         top_right = tk.Frame(top)
         top_right.pack(side=tk.RIGHT)
@@ -410,12 +428,12 @@ class PlannerGUI(tk.Tk):
         tk.Label(top_right, textvariable=self.profile_var, font=("Helvetica", 10)).pack(side=tk.RIGHT, padx=(0, 10))
 
         middle = tk.Frame(root)
-        middle.pack(pady=(8, 10))
+        middle.pack(pady=(6, 8))
 
-        left = tk.Frame(middle, bd=1, relief=tk.GROOVE, padx=10, pady=10)
-        left.pack(side=tk.LEFT, padx=(0, 10))
+        left = tk.Frame(middle, bd=1, relief=tk.GROOVE, padx=8, pady=8)
+        left.pack(side=tk.LEFT, padx=(0, 8))
         tk.Label(left, text="Current Board (8x8)", font=("Helvetica", 10, "bold")).pack()
-        self.board_view = ToggleGrid(left, rows=8, cols=8, cell=24, editable=True)
+        self.board_view = ToggleGrid(left, rows=8, cols=8, cell=20, editable=True)
         self.board_view.pack(pady=6)
 
         buttons = tk.Frame(left)
@@ -431,36 +449,45 @@ class PlannerGUI(tk.Tk):
         previews_row.pack(pady=(4, 10))
         self.move_panels = [MovePreviewPanel(previews_row, i + 1) for i in range(3)]
         for p in self.move_panels:
-            p.pack(side=tk.LEFT, padx=6)
+            p.pack(side=tk.LEFT, padx=4)
 
         tk.Label(right, text="Piece Inputs", font=("Helvetica", 10, "bold")).pack(anchor="w")
         editors_row = tk.Frame(right)
         editors_row.pack(pady=(4, 0))
         self.panels = [PiecePanel(editors_row, i) for i in range(3)]
         for p in self.panels:
-            p.pack(side=tk.LEFT, padx=6)
+            p.pack(side=tk.LEFT, padx=4)
 
         bottom = tk.Frame(root)
         bottom.pack(fill=tk.X)
         tk.Button(bottom, text="Submit", width=18, command=self._submit).pack(side=tk.LEFT)
         tk.Button(bottom, text="Undo Board Sync", width=18, command=self._sync_board_view).pack(side=tk.LEFT, padx=8)
 
-        live = tk.Frame(root, bd=1, relief=tk.GROOVE, padx=8, pady=8)
+        live = tk.Frame(root, bd=1, relief=tk.GROOVE, padx=6, pady=6)
         live.pack(fill=tk.X, pady=(8, 0))
         tk.Label(live, text="Live CV Stream", font=("Helvetica", 10, "bold")).grid(row=0, column=0, sticky="w")
-        tk.Label(live, textvariable=self.live_status_var, fg="#1f5e9f").grid(row=0, column=1, columnspan=5, sticky="w", padx=(8, 0))
-
-        tk.Label(live, text="Window title contains:").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        tk.Entry(live, textvariable=self.live_window_title_var, width=26).grid(row=1, column=1, sticky="w", pady=(6, 0))
-        tk.Label(live, text="Bank ROI norm x0,y0,x1,y1:").grid(row=1, column=2, sticky="w", padx=(10, 0), pady=(6, 0))
-        tk.Entry(live, textvariable=self.live_bank_roi_var, width=20).grid(row=1, column=3, sticky="w", pady=(6, 0))
-        tk.Button(live, text="Attach Stream", command=self._attach_live_stream).grid(row=1, column=4, padx=(10, 0), pady=(6, 0))
-        tk.Button(live, text="Detach", command=self._detach_live_stream).grid(row=1, column=5, padx=(6, 0), pady=(6, 0))
         tk.Label(
             live,
-            text="Press Space to run: capture -> recognize -> evaluate -> display",
+            textvariable=self.live_status_var,
+            fg="#1f5e9f",
+            justify="left",
+            wraplength=540,
+        ).grid(row=0, column=1, columnspan=5, sticky="w", padx=(8, 0))
+
+        tk.Label(live, text="Window title contains:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        tk.Entry(live, textvariable=self.live_window_title_var, width=22).grid(row=1, column=1, sticky="w", pady=(6, 0))
+        tk.Label(live, text="Bank ROI norm x0,y0,x1,y1:").grid(row=1, column=2, sticky="w", padx=(10, 0), pady=(6, 0))
+        tk.Entry(live, textvariable=self.live_bank_roi_var, width=18).grid(row=1, column=3, sticky="w", pady=(6, 0))
+        tk.Button(live, text="Attach Stream", command=self._attach_live_stream).grid(row=1, column=4, padx=(10, 0), pady=(6, 0))
+        tk.Button(live, text="Detach", command=self._detach_live_stream).grid(row=1, column=5, padx=(6, 0), pady=(6, 0))
+        tk.Button(live, text=f"Run Cycle ({self.live_trigger_keybind})", command=self._on_live_trigger).grid(
+            row=1, column=6, padx=(6, 0), pady=(6, 0)
+        )
+        tk.Label(
+            live,
+            text=f"Press {self.live_trigger_keybind}: capture -> detect -> evaluate -> display",
             fg="#555",
-        ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        ).grid(row=2, column=0, columnspan=7, sticky="w", pady=(6, 0))
 
     def _clear_board(self) -> None:
         self.board = Board()
@@ -602,7 +629,9 @@ class PlannerGUI(tk.Tk):
             self.live_status_var.set(
                 f"Live stream: attached (title~'{title}', roi={format_norm_roi_xyxy(roi)})"
             )
-            self.status_var.set("Live capture attached. Press Space to capture/recognize/evaluate.")
+            self.status_var.set(
+                f"Live capture attached. Press {self.live_trigger_keybind} to capture/recognize/evaluate."
+            )
         except Exception as exc:  # noqa: BLE001
             self.live_planner = None
             messagebox.showerror("Live Stream", f"Failed to attach stream: {exc}")
@@ -616,7 +645,7 @@ class PlannerGUI(tk.Tk):
         self.live_planner = None
         self.live_status_var.set("Live stream: detached")
 
-    def _on_space_trigger(self, event=None) -> None:  # noqa: ANN001
+    def _on_live_trigger(self, event=None) -> None:  # noqa: ANN001
         if self.live_planner is None:
             return
 
@@ -624,7 +653,12 @@ class PlannerGUI(tk.Tk):
         self.board = Board(self.board_view.get_data())
         active_profile = self._refresh_profile_label()
         try:
-            result = self.live_planner.process_once(self.board, streak=self.streak, profile=active_profile)
+            result = self.live_planner.process_once(
+                self.board,
+                streak=self.streak,
+                moves_since_clear=self.moves_since_clear,
+                profile=active_profile,
+            )
         except Exception as exc:  # noqa: BLE001
             self.status_var.set(f"Live cycle failed: {exc}")
             return
@@ -659,7 +693,14 @@ class PlannerGUI(tk.Tk):
                 p.reset()
             return
 
-        plan = self.agent.best_plan(self.board, piece_bank, used, self.streak, profile=active_profile)
+        plan = self.agent.best_plan(
+            self.board,
+            piece_bank,
+            used,
+            self.streak,
+            moves_since_clear=self.moves_since_clear,
+            profile=active_profile,
+        )
         if not plan:
             self.status_var.set("Agent could not find a valid plan.")
             for p in self.move_panels:
@@ -669,7 +710,6 @@ class PlannerGUI(tk.Tk):
         for p in self.move_panels:
             p.reset()
 
-        round_had_clear = False
         lines_out: List[str] = []
         for move_no, (piece_idx, row, col) in enumerate(plan, start=1):
             panel = self.move_panels[move_no - 1]
@@ -684,15 +724,15 @@ class PlannerGUI(tk.Tk):
 
             cells, _, _ = Board.get_footprint(piece)
             lines = self.board.apply_move(piece, row, col)
-            pts, self.streak = calculate_score(len(cells), lines, self.streak)
+            pts, self.streak, self.moves_since_clear = calculate_score(
+                len(cells),
+                lines,
+                self.streak,
+                self.moves_since_clear,
+            )
             self.score += pts
-            if lines > 0:
-                round_had_clear = True
 
             lines_out.append(f"Move {move_no}: (P{piece_idx + 1}), ({row + 1}, {col + 1})")
-
-        if not round_had_clear:
-            self.streak = 0
 
         if lines_out and clear_inputs:
             for p in self.panels:

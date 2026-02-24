@@ -57,7 +57,8 @@ Default shape:
   "live_bank_roi_norm_xyxy": [0.0633, 0.6945, 0.9221, 0.8135],
   "expected_cell_px": 20.0,
   "capture_target_fps": 20.0,
-  "capture_window_refresh_sec": 1.0
+  "capture_window_refresh_sec": 1.0,
+  "live_trigger_keybind": "<F8>"
 }
 ```
 
@@ -66,6 +67,7 @@ If someone else runs this project, they should edit only this file for:
 - normalized bank ROI
 - known piece cell size (currently 20 px)
 - capture loop timing
+- hotkey for live capture trigger
 
 ---
 
@@ -84,7 +86,8 @@ Expected result:
 
 Then in the GUI:
 1. Click `Attach Stream`
-2. Press `Space` each turn (`capture -> recognize -> evaluate -> display`)
+2. Press `F8` each turn (`capture -> recognize -> evaluate -> display`)  
+   Keybind is configurable in `runtime_config.json` via `live_trigger_keybind`.
 
 ---
 
@@ -96,12 +99,13 @@ The production path for mirrored-stream automation is:
 2. `piece_bank_detector.PieceBankDetector` reads the configured bank ROI, splits into 3 slots, segments piece cells, and converts each slot to a 5x5 matrix.
 3. `live_cv_bridge.LiveCVPlanner` feeds those piece matrices to `HeuristicAgent` and returns move order + placements.
 4. `round_planner_gui.py` displays move previews and applies the final board state.  
-   Press `Space` in GUI after attaching stream to trigger capture -> recognize -> evaluate -> display.
+   Press `F8` in GUI after attaching stream to trigger capture -> recognize -> evaluate -> display.
 
 GUI live controls:
 - `Window title contains` (e.g. `Movie Recording`)
 - `Bank ROI norm x0,y0,x1,y1` (normalized coordinates in captured window)
-- `Attach Stream`, then press `Space` for each cycle
+- `Attach Stream`, then press `F8` for each cycle
+- `runtime_config.json` supports `live_trigger_keybind` (example: `<F8>` or `<Return>`)
 
 Default ROI normalization in GUI is derived from approximate calibration:
 - Window approx: `(1028,25)` to `(1439,899)`
@@ -188,8 +192,8 @@ A few things to notice:
 
 - **Tiles placed** always count — even a move that clears nothing scores 1 point per cell placed.
 - **Line clear bonus** scales linearly with the number of lines cleared in that move.
-- **Streak** multiplies line points — each consecutive round where you clear at least one line increases your streak by 1. A streak of 5 makes every line worth 50 points instead of 10.
-- **Streak resets** only at the end of a full round (all 3 pieces placed) with zero line clears. Missing a line mid-round doesn't reset anything.
+- **Streak window**: a streak only continues if the next line clear happens within **3 moves** of the previous clear.
+- **Streak reset behavior**: if you go more than 3 moves without a line clear, streak drops to 0; the next clear starts streak at 1.
 
 ---
 
@@ -302,7 +306,7 @@ This is also implemented with bitwise operations: instead of looping over a 2D a
 3. Ask the agent for its best move
 4. Place the piece, clear lines, update score and streak
 5. Repeat until all 3 pieces placed
-6. If no lines cleared this round, reset streak
+6. If >3 moves pass without a clear, streak resets
 7. Go to step 1
 ```
 
