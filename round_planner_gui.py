@@ -14,6 +14,7 @@ Features:
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import tkinter as tk
@@ -33,12 +34,23 @@ from piece_bank_detector import PieceBankDetectorConfig
 from pieces import ALL_PIECES
 from stream_capture import CaptureConfig
 
+PROFILE_MODES = ("auto", "safe", "balanced", "aggressive")
+
 
 @dataclass(frozen=True)
 class PieceMeta:
     name: str
     piece: np.ndarray
     key: str
+
+
+@dataclass(frozen=True)
+class RoundSnapshot:
+    board: np.ndarray
+    score: int
+    streak: int
+    moves_since_clear: int
+    source_label: str
 
 
 def piece_footprint(piece: np.ndarray) -> np.ndarray:
@@ -353,10 +365,13 @@ class MovePreviewPanel(tk.Frame):
 
 
 class PlannerGUI(tk.Tk):
-    def __init__(self):
+    def __init__(self, profile_mode: str = "auto"):
         super().__init__()
         self.title("Block Blast Round Planner")
         self.resizable(False, False)
+        if profile_mode not in PROFILE_MODES:
+            raise ValueError(f"Invalid profile mode '{profile_mode}'. Expected one of: {', '.join(PROFILE_MODES)}")
+        self.profile_mode = profile_mode
 
         self.by_key = build_piece_map()
         self.agent = HeuristicAgent()
@@ -364,6 +379,7 @@ class PlannerGUI(tk.Tk):
         self.score = 0
         self.streak = 0
         self.moves_since_clear = STREAK_CLEAR_WINDOW
+        self.last_round_snapshot: Optional[RoundSnapshot] = None
 
         self.timer_total_seconds = 6 * 60
         self.timer_remaining_seconds = self.timer_total_seconds
@@ -394,7 +410,7 @@ class PlannerGUI(tk.Tk):
         self.status_var = tk.StringVar(value="Draw board/pieces, then click Submit.")
         self.score_var = tk.StringVar(value="Score: 0   Streak: 0")
         self.timer_var = tk.StringVar(value=f"Time: {self._format_seconds(self.timer_remaining_seconds)}")
-        self.profile_var = tk.StringVar(value="Profile: balanced")
+        self.profile_var = tk.StringVar(value="Profile: -")
 
         self._build_layout()
         self._sync_board_view()
@@ -461,6 +477,14 @@ class PlannerGUI(tk.Tk):
         bottom = tk.Frame(root)
         bottom.pack(fill=tk.X)
         tk.Button(bottom, text="Submit", width=18, command=self._submit).pack(side=tk.LEFT)
+        self.undo_cycle_btn = tk.Button(
+            bottom,
+            text="Undo Last Cycle",
+            width=18,
+            command=self._undo_last_cycle,
+            state=tk.DISABLED,
+        )
+        self.undo_cycle_btn.pack(side=tk.LEFT, padx=8)
         tk.Button(bottom, text="Undo Board Sync", width=18, command=self._sync_board_view).pack(side=tk.LEFT, padx=8)
 
         live = tk.Frame(root, bd=1, relief=tk.GROOVE, padx=6, pady=6)
@@ -501,6 +525,28 @@ class PlannerGUI(tk.Tk):
             p.reset()
         self.status_var.set("Piece inputs cleared.")
 
+    def _set_undo_available(self, enabled: bool) -> None:
+        state = tk.NORMAL if enabled else tk.DISABLED
+        if hasattr(self, "undo_cycle_btn"):
+            self.undo_cycle_btn.configure(state=state)
+
+    def _undo_last_cycle(self) -> None:
+        snap = self.last_round_snapshot
+        if snap is None:
+            self.status_var.set("No cycle to undo.")
+            return
+
+        self.board = Board(snap.board.copy())
+        self.score = int(snap.score)
+        self.streak = int(snap.streak)
+        self.moves_since_clear = int(snap.moves_since_clear)
+        for p in self.move_panels:
+            p.reset()
+        self._sync_board_view()
+        self.last_round_snapshot = None
+        self._set_undo_available(False)
+        self.status_var.set(f"Undid last cycle ({snap.source_label}).")
+
     def _sync_board_view(self) -> None:
         self.board_view.set_data(self.board.board)
         self.score_var.set(f"Score: {self.score}   Streak: {self.streak}")
@@ -513,6 +559,8 @@ class PlannerGUI(tk.Tk):
         return f"{mm:02d}:{ss:02d}"
 
     def _active_profile(self) -> str:
+        if self.profile_mode != "auto":
+            return self.profile_mode
         remaining = self._current_remaining_seconds()
         # If timer has not started, stay on balanced.
         if (not self.timer_running) and remaining == self.timer_total_seconds:
@@ -527,7 +575,8 @@ class PlannerGUI(tk.Tk):
         self.timer_remaining_seconds = self._current_remaining_seconds()
         self.timer_var.set(f"Time: {self._format_seconds(self.timer_remaining_seconds)}")
         profile = self._active_profile()
-        self.profile_var.set(f"Profile: {profile}")
+        suffix = " (forced)" if self.profile_mode != "auto" else ""
+        self.profile_var.set(f"Profile: {profile}{suffix}")
         return profile
 
     def _current_remaining_seconds(self) -> int:
@@ -551,7 +600,10 @@ class PlannerGUI(tk.Tk):
         self.timer_running = True
         self.timer_end_monotonic = time.monotonic() + self.timer_total_seconds
         self._refresh_profile_label()
-        self.status_var.set("Timer started (6:00). Profile auto-switches by time left.")
+        if self.profile_mode == "auto":
+            self.status_var.set("Timer started (6:00). Profile auto-switches by time left.")
+        else:
+            self.status_var.set(f"Timer started (6:00). Profile is forced to {self.profile_mode}.")
         self.timer_job = self.after(1000, self._timer_tick)
 
     def _timer_tick(self) -> None:
@@ -684,6 +736,14 @@ class PlannerGUI(tk.Tk):
         source_label: str,
         clear_inputs: bool = True,
     ) -> None:
+        pre_round_snapshot = RoundSnapshot(
+            board=self.board.board.copy(),
+            score=int(self.score),
+            streak=int(self.streak),
+            moves_since_clear=int(self.moves_since_clear),
+            source_label=source_label,
+        )
+
         piece_bank = [m.piece.copy() for m in resolved]
         used = [False, False, False]
 
@@ -740,6 +800,8 @@ class PlannerGUI(tk.Tk):
 
         self._sync_board_view()
         if lines_out:
+            self.last_round_snapshot = pre_round_snapshot
+            self._set_undo_available(True)
             self.status_var.set(f"{source_label} | profile={active_profile} | " + " | ".join(lines_out))
         else:
             self.status_var.set("No moves applied.")
@@ -761,7 +823,16 @@ class PlannerGUI(tk.Tk):
 
 
 def main() -> None:
-    app = PlannerGUI()
+    parser = argparse.ArgumentParser(description="Block Blast round planner GUI")
+    parser.add_argument(
+        "--profile",
+        choices=PROFILE_MODES,
+        default="auto",
+        help="Planning profile mode: auto (timer-based) or force one profile.",
+    )
+    args = parser.parse_args()
+
+    app = PlannerGUI(profile_mode=args.profile)
     app.mainloop()
 
 
