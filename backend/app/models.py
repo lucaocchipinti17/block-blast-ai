@@ -27,6 +27,12 @@ class User(db.Model):
     licenses = db.relationship("License", back_populates="user", cascade="all, delete-orphan")
     devices = db.relationship("Device", back_populates="user", cascade="all, delete-orphan")
     sessions = db.relationship("AuthSession", back_populates="user", cascade="all, delete-orphan")
+    consumed_activation_keys = db.relationship(
+        "ActivationKey",
+        back_populates="consumed_by_user",
+        cascade="save-update",
+        foreign_keys="ActivationKey.consumed_by_user_id",
+    )
 
     __table_args__ = (
         CheckConstraint("role IN ('user', 'admin')", name="ck_users_role"),
@@ -52,6 +58,31 @@ class License(db.Model):
         CheckConstraint("status IN ('active', 'suspended', 'cancelled', 'expired')", name="ck_licenses_status"),
         CheckConstraint("max_devices > 0", name="ck_licenses_max_devices"),
         Index("ix_licenses_user_product", "user_id", "product_code"),
+    )
+
+
+class ActivationKey(db.Model):
+    __tablename__ = "activation_keys"
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid4()))
+    key_hash = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    status = db.Column(db.String(20), nullable=False, default="active")
+    product_code = db.Column(db.String(50), nullable=False, default="BLOCK_BLAST_SOLVER")
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    expires_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    consumed_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    consumed_by_user_id = db.Column(
+        db.String(36),
+        db.ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    consumed_by_user = db.relationship("User", back_populates="consumed_activation_keys")
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'consumed', 'revoked', 'expired')", name="ck_activation_keys_status"),
+        Index("ix_activation_keys_status", "status"),
     )
 
 
@@ -95,36 +126,12 @@ class AuthSession(db.Model):
 
     user = db.relationship("User", back_populates="sessions")
     device = db.relationship("Device", back_populates="sessions")
-    lock = db.relationship("ActiveSessionLock", back_populates="session", uselist=False)
 
     __table_args__ = (
         CheckConstraint("status IN ('active', 'expired', 'revoked')", name="ck_auth_sessions_status"),
         Index("ix_auth_sessions_user_status", "user_id", "status"),
         Index("ix_auth_sessions_device_status", "device_id", "status"),
     )
-
-
-class ActiveSessionLock(db.Model):
-    """
-    Enforces one currently-active session per user.
-
-    The row key is user_id; the referenced session_id points to the active lease.
-    Replacing this row (in a transaction) implements session takeover.
-    """
-
-    __tablename__ = "active_session_locks"
-
-    user_id = db.Column(db.String(36), db.ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
-    session_id = db.Column(
-        db.String(36),
-        db.ForeignKey("auth_sessions.id", ondelete="CASCADE"),
-        unique=True,
-        nullable=False,
-    )
-    locked_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
-    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
-
-    session = db.relationship("AuthSession", back_populates="lock")
 
 
 class LoginAudit(db.Model):

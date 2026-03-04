@@ -18,15 +18,15 @@ import time
 
 import numpy as np
 
-from board import Board
-from model import HeuristicAgent
-from piece_bank_detector import (
+from client.core.board import Board
+from client.engine.model import HeuristicAgent
+from client.vision.piece_bank_detector import (
     DetectedPiece,
     PieceBankDetection,
     PieceBankDetector,
     PieceBankDetectorConfig,
 )
-from stream_capture import CaptureConfig, WindowCaptureLoop
+from client.vision.stream_capture import CaptureConfig, WindowCaptureLoop
 
 
 @dataclass(frozen=True)

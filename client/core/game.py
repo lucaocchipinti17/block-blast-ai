@@ -6,11 +6,17 @@ Run with: python game.py
 
 import os
 import random
+import sys
 import numpy as np
+from pathlib import Path
 from typing import Optional
 
-from board import Board
-from pieces import ALL_PIECES
+# Allow direct script execution: python client/core/game.py
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from client.core.board import Board
+from client.core.pieces import ALL_PIECES
 
 
 # ── Scoring constants ─────────────────────────────────────────────────────────

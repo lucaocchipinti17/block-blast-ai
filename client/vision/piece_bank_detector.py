@@ -19,8 +19,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from board import Board
-from pieces import ALL_PIECES
+from client.core.board import Board
+from client.core.pieces import ALL_PIECES
 
 try:
     import cv2

@@ -37,9 +37,9 @@ import numpy as np
 from itertools import permutations as iter_permutations
 from typing import Optional
 
-from board import Board
+from client.core.board import Board
 try:
-    import cxx_engine
+    from client.engine import cxx_engine
 except Exception:  # noqa: BLE001
     cxx_engine = None
 

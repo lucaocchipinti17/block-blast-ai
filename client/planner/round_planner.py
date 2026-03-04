@@ -17,16 +17,22 @@ Run:
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass
 import re
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 
-from board import Board
-from game import STREAK_CLEAR_WINDOW, calculate_score
-from model import HeuristicAgent
-from pieces import ALL_PIECES
+# Allow direct script execution: python client/planner/round_planner.py
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from client.core.board import Board
+from client.core.game import STREAK_CLEAR_WINDOW, calculate_score
+from client.engine.model import HeuristicAgent
+from client.core.pieces import ALL_PIECES
 
 
 @dataclass(frozen=True)

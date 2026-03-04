@@ -17,13 +17,19 @@ Usage
 
 import argparse
 import random
+import sys
 import time
+from pathlib import Path
 import numpy as np
 
-from board import Board
-from pieces import ALL_PIECES
-from game import STREAK_CLEAR_WINDOW, calculate_score
-from model import HeuristicAgent
+# Allow direct script execution: python client/tools/test.py
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from client.core.board import Board
+from client.core.pieces import ALL_PIECES
+from client.core.game import STREAK_CLEAR_WINDOW, calculate_score
+from client.engine.model import HeuristicAgent
 
 
 def run_game(agent: HeuristicAgent, piece_pool: dict, verbose: bool = False) -> dict:

@@ -19,6 +19,7 @@ import json
 import re
 import tkinter as tk
 import time
+import sys
 from tkinter import messagebox
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,13 +27,17 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from board import Board
-from game import STREAK_CLEAR_WINDOW, calculate_score
-from live_cv_bridge import LiveCVConfig, LiveCVPlanner
-from model import HeuristicAgent
-from piece_bank_detector import PieceBankDetectorConfig
-from pieces import ALL_PIECES
-from stream_capture import CaptureConfig
+# Allow direct script execution: python client/planner/round_planner_gui.py
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from client.core.board import Board
+from client.core.game import STREAK_CLEAR_WINDOW, calculate_score
+from client.vision.live_cv_bridge import LiveCVConfig, LiveCVPlanner
+from client.engine.model import HeuristicAgent
+from client.vision.piece_bank_detector import PieceBankDetectorConfig
+from client.core.pieces import ALL_PIECES
+from client.vision.stream_capture import CaptureConfig
 
 PROFILE_MODES = ("auto", "safe", "balanced", "aggressive")
 
@@ -163,7 +168,7 @@ DEFAULT_BANK_ROI_NORM = derive_norm_roi_from_approx_abs(
     roi_xyxy=DEFAULT_BANK_ROI_APPROX_XYXY,
 )
 
-RUNTIME_CONFIG_PATH = Path(__file__).resolve().parent / "runtime_config.json"
+RUNTIME_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "runtime_config.json"
 DEFAULT_RUNTIME_CONFIG = {
     "live_window_title_contains": "Movie Recording",
     "live_bank_roi_norm_xyxy": DEFAULT_BANK_ROI_NORM,

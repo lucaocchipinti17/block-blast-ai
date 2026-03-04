@@ -58,6 +58,18 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
     CONSTRAINT ck_auth_sessions_status CHECK (status IN ('active', 'expired', 'revoked'))
 );
 
+CREATE TABLE IF NOT EXISTS activation_keys (
+    id VARCHAR(36) PRIMARY KEY,
+    key_hash VARCHAR(64) NOT NULL UNIQUE,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    product_code VARCHAR(50) NOT NULL DEFAULT 'BLOCK_BLAST_SOLVER',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NULL,
+    consumed_at TIMESTAMPTZ NULL,
+    consumed_by_user_id VARCHAR(36) NULL REFERENCES users(id) ON DELETE SET NULL,
+    CONSTRAINT ck_activation_keys_status CHECK (status IN ('active', 'consumed', 'revoked', 'expired'))
+);
+
 -- Exactly one active lease row per user (enforced by user_id primary key).
 CREATE TABLE IF NOT EXISTS active_session_locks (
     user_id VARCHAR(36) PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -84,6 +96,7 @@ CREATE INDEX IF NOT EXISTS ix_licenses_user_product ON licenses(user_id, product
 CREATE INDEX IF NOT EXISTS ix_devices_user_revoked ON devices(user_id, is_revoked);
 CREATE INDEX IF NOT EXISTS ix_auth_sessions_user_status ON auth_sessions(user_id, status);
 CREATE INDEX IF NOT EXISTS ix_auth_sessions_device_status ON auth_sessions(device_id, status);
+CREATE INDEX IF NOT EXISTS ix_activation_keys_status ON activation_keys(status);
 CREATE INDEX IF NOT EXISTS ix_login_audit_user_time ON login_audit(user_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_login_audit_email_time ON login_audit(email, created_at);
 

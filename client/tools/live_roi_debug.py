@@ -16,13 +16,19 @@ Use this to verify that the ROI split is correct before running detection/planni
 from __future__ import annotations
 
 import argparse
+import sys
 import time
+from pathlib import Path
 from typing import Tuple
 
 import cv2
 import numpy as np
 
-from stream_capture import CaptureConfig, WindowCaptureLoop
+# Allow direct script execution: python client/tools/live_roi_debug.py
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from client.vision.stream_capture import CaptureConfig, WindowCaptureLoop
 
 
 def parse_norm_roi(raw: str) -> Tuple[float, float, float, float]:
@@ -176,4 +182,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

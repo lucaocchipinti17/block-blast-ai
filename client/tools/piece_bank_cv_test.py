@@ -12,16 +12,22 @@ Interactive test runner for piece-bank CV:
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
 
-from piece_bank_cv import (
+# Allow direct script execution: python client/tools/piece_bank_cv_test.py
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from client.vision.piece_bank_cv import (
     detect_piece_bank,
     draw_piece_bank_detections,
     select_piece_bank_region_with_mouse,
 )
-from pieces import ALL_PIECES
+from client.core.pieces import ALL_PIECES
 
 try:
     import cv2

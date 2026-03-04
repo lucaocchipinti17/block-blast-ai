@@ -1,0 +1,355 @@
+openapi: 3.0.3
+info:
+  title: Block Blast Backend API
+  version: 1.0.0
+  description: >
+    Simple HWID-bound authentication API for Block Blast app distribution.
+servers:
+  - url: http://127.0.0.1:5000
+    description: Local development
+tags:
+  - name: System
+  - name: Admin
+  - name: Auth
+paths:
+  /health:
+    get:
+      tags: [System]
+      summary: Health check
+      responses:
+        "200":
+          description: API is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /admin/add_key:
+    post:
+      tags: [Admin]
+      summary: Create one-time activation key(s)
+      description: Private endpoint; requires admin secret header.
+      security:
+        - AdminSecret: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddKeyRequest"
+      responses:
+        "201":
+          description: Key(s) created
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/AddKeySingleResponse"
+                  - $ref: "#/components/schemas/AddKeyMultiResponse"
+        "400":
+          $ref: "#/components/responses/Error400"
+        "401":
+          $ref: "#/components/responses/Error401"
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register account and bind device
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "201":
+          description: Registration completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "400":
+          $ref: "#/components/responses/Error400"
+        "409":
+          description: Email already registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal registration failure
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login with email/password/HWID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+        "400":
+          $ref: "#/components/responses/Error400"
+        "401":
+          $ref: "#/components/responses/Error401"
+        "403":
+          description: License inactive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /auth/validate:
+    post:
+      tags: [Auth]
+      summary: Validate current token + HWID
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ValidateRequest"
+      responses:
+        "200":
+          description: Token is valid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidateResponse"
+        "400":
+          $ref: "#/components/responses/Error400"
+        "401":
+          $ref: "#/components/responses/Error401"
+        "403":
+          description: Account/license inactive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke current token
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Logout successful or token already inactive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Error401"
+
+  /openapi.yaml:
+    get:
+      tags: [System]
+      summary: Raw OpenAPI YAML spec
+      responses:
+        "200":
+          description: OpenAPI YAML
+          content:
+            application/yaml:
+              schema:
+                type: string
+
+  /docs:
+    get:
+      tags: [System]
+      summary: Swagger UI docs page
+      responses:
+        "200":
+          description: Swagger UI HTML page
+          content:
+            text/html:
+              schema:
+                type: string
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: token
+    AdminSecret:
+      type: apiKey
+      in: header
+      name: X-Admin-Secret
+
+  responses:
+    Error400:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Error401:
+      description: Unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    HealthResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        status:
+          type: string
+          example: ok
+
+    AddKeyRequest:
+      type: object
+      properties:
+        count:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 1
+
+    AddKeySingleResponse:
+      type: object
+      required: [ok, activation_key]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        activation_key:
+          type: string
+          example: BB-1A2B3C4D5E6F7A8B9C0D1E2F
+
+    AddKeyMultiResponse:
+      type: object
+      required: [ok, activation_keys]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        activation_keys:
+          type: array
+          items:
+            type: string
+
+    RegisterRequest:
+      type: object
+      required: [email, password, hwid, activation_key]
+      properties:
+        email:
+          type: string
+          format: email
+          example: test@example.com
+        password:
+          type: string
+          minLength: 8
+          example: StrongPass123!
+        hwid:
+          type: string
+          example: MAC-ABC-123
+        activation_key:
+          type: string
+          example: BB-1A2B3C4D5E6F7A8B9C0D1E2F
+        device_label:
+          type: string
+          example: MacBook Pro 14
+
+    LoginRequest:
+      type: object
+      required: [email, password, hwid]
+      properties:
+        email:
+          type: string
+          format: email
+          example: test@example.com
+        password:
+          type: string
+          example: StrongPass123!
+        hwid:
+          type: string
+          example: MAC-ABC-123
+
+    ValidateRequest:
+      type: object
+      required: [hwid]
+      properties:
+        hwid:
+          type: string
+          example: MAC-ABC-123
+
+    LoginResponse:
+      type: object
+      required: [ok, access_token, token_type, expires_at]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        access_token:
+          type: string
+          example: bbs_ZD5m3hQQ0v7YbK8rW2...
+        token_type:
+          type: string
+          example: bearer
+        expires_at:
+          type: string
+          format: date-time
+
+    ValidateResponse:
+      type: object
+      required: [ok, valid, user_id, email, expires_at]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        valid:
+          type: boolean
+          example: true
+        user_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        expires_at:
+          type: string
+          format: date-time
+
+    MessageResponse:
+      type: object
+      required: [ok, message]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        message:
+          type: string
+          example: Logged out.
+
+    ErrorResponse:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+          example: false
+        error:
+          type: string
+          example: Invalid credentials or device.
